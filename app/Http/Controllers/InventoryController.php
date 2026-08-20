@@ -2,205 +2,116 @@
 
 namespace App\Http\Controllers;
 
-use App\Http\Requests\StoreInventoryRequest;
-use App\Http\Requests\TransferInventoryRequest;
-use App\Http\Requests\AdjustInventoryRequest;
-use App\Models\Location;
+use App\Enums\StockAdjustmentAction;
+use App\Exceptions\BusinessRuleException;
+use App\Http\Requests\StoreManualAdjustmentRequest;
 use App\Models\Inventory;
 use App\Models\InventoryLog;
+use App\Models\Location;
 use App\Models\Material;
-use Illuminate\Routing\Controllers\HasMiddleware;
-use Illuminate\Routing\Controllers\Middleware;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\DB;
+use App\Services\InventoryService;
+use Illuminate\Http\RedirectResponse;
 use Inertia\Inertia;
-use App\Http\Requests\StoreManualAdjustmentRequest;
+use Inertia\Response;
 
-class InventoryController extends Controller implements HasMiddleware
+/**
+ * Stock balances and the manual adjustment screen.
+ *
+ * Quantities are never written here: each action delegates to
+ * InventoryService, which locks the row, refuses to go negative and writes the
+ * matching movement log.
+ */
+class InventoryController extends Controller
 {
-    public static function middleware(): array
-    {
-        return [
-            new Middleware('permission:inventory-view', only: ['index', 'show']),
-            new Middleware('permission:inventory-adjust', only: ['manualAdjustment', 'processManualAdjustment']),
-            new Middleware('permission:inventory-delete', only: ['destroy']),
-        ];
-    }
+    public function __construct(private readonly InventoryService $inventory) {}
 
-    public function index()
+    public function index(): Response
     {
-        $inventories = Inventory::with(['material', 'location'])
-            ->latest()
-            ->get();
+        $this->authorize('viewAny', Inventory::class);
 
         return Inertia::render('inventory/index', [
-            'inventories' => $inventories,
+            'inventories' => Inventory::query()
+                ->with(['material.uom', 'location:id,code,name'])
+                ->latest()
+                ->get(),
         ]);
     }
 
-    public function show(Inventory $inventory)
+    public function show(Inventory $inventory): Response
     {
-        $inventory->load(['material', 'location']);
+        $this->authorize('view', $inventory);
 
-        $logs = InventoryLog::with(['user', 'location', 'transferLocation'])
-            ->where('inventory_id', $inventory->id)
-            ->latest()
-            ->get();
+        $inventory->load(['material.uom', 'location']);
 
         return Inertia::render('inventory/show', [
             'inventory' => $inventory,
-            'logs'      => $logs,
+            'logs' => InventoryLog::query()
+                ->with(['user:id,name', 'location:id,name', 'transferLocation:id,name'])
+                ->where('inventory_id', $inventory->id)
+                ->latest()
+                ->get(),
         ]);
     }
 
-    public function destroy(Inventory $inventory)
+    public function destroy(Inventory $inventory): RedirectResponse
     {
-        if ($inventory->quantity > 0) {
-            return redirect()->route('inventories.index')
-                ->withErrors(['error' => 'Cannot delete inventory with remaining stock.']);
+        $this->authorize('delete', $inventory);
+
+        if (! $inventory->isEmpty()) {
+            throw BusinessRuleException::make('Cannot delete a stock record that still holds quantity.')
+                ->redirectTo('inventories.index');
         }
 
         $inventory->delete();
 
-        return redirect()->route('inventories.index')
-            ->with('success', 'Inventory deleted successfully');
+        return redirect()
+            ->route('inventories.index')
+            ->with('success', "Stock record {$inventory->code} deleted successfully.");
     }
 
-    public function manualAdjustment()
+    /**
+     * Manual adjustment form: opening stock, corrections and transfers.
+     */
+    public function manualAdjustment(): Response
     {
+        $this->authorize('adjust', Inventory::class);
+
         return Inertia::render('inventory/manual-adjustment', [
-            'materials' => Material::where('status', 'active')->get(['id', 'code', 'name']),
-            'locations' => Location::all(['id', 'code', 'name']),
-            'inventories' => Inventory::with(['material', 'location'])->get(['id', 'material_id', 'location_id', 'quantity']),
+            'materials' => Material::query()->active()->orderBy('name')->get(['id', 'code', 'name']),
+            'locations' => Location::query()->orderBy('name')->get(['id', 'code', 'name']),
+            'inventories' => Inventory::query()
+                ->with(['material:id,code,name', 'location:id,code,name'])
+                ->get(['id', 'material_id', 'location_id', 'quantity']),
+            'actions' => StockAdjustmentAction::options(),
         ]);
     }
 
-    public function processManualAdjustment(StoreManualAdjustmentRequest $request)
+    public function processManualAdjustment(StoreManualAdjustmentRequest $request): RedirectResponse
     {
-        $request->validate([
-            'action'          => ['required', 'in:initial,adjust,transfer'],
-            'transaction_date' => ['required', 'date'],
-            'location_id'     => ['required', 'exists:locations,id'],
-            'material_id'     => ['required_if:action,initial', 'nullable', 'exists:materials,id'],
-            'inventory_id'    => ['required_unless:action,initial', 'nullable', 'exists:inventories,id'],
-            'quantity'        => ['required', 'numeric', 'min:0.000001'],
-            'transfer_location_id' => ['required_if:action,transfer', 'nullable', 'exists:locations,id', 'different:location_id'],
-            'remarks'         => ['nullable', 'string'],
-        ]);
+        $data = $request->toData();
 
-        DB::transaction(function () use ($request) {
-            if ($request->action === 'initial') {
-                // Reuse existing store logic
-                $existing = Inventory::where('material_id', $request->material_id)
-                    ->where('location_id', $request->location_id)
-                    ->whereNull('deleted_at')
-                    ->first();
+        match ($data->action) {
+            StockAdjustmentAction::Initial => $this->inventory->initialise(
+                materialId: (int) $data->materialId,
+                locationId: $data->locationId,
+                quantity: $data->quantity,
+                remarks: $data->remarks,
+            ),
+            StockAdjustmentAction::Adjust => $this->inventory->adjustTo(
+                inventory: Inventory::findOrFail($data->inventoryId),
+                quantity: $data->quantity,
+                remarks: $data->remarks,
+            ),
+            StockAdjustmentAction::Transfer => $this->inventory->transfer(
+                inventory: Inventory::findOrFail($data->inventoryId),
+                toLocationId: (int) $data->transferLocationId,
+                quantity: $data->quantity,
+                remarks: $data->remarks,
+            ),
+        };
 
-                if ($existing) {
-                    abort(422, 'This material already exists in the selected location.');
-                }
-
-                $inventory = Inventory::create([
-                    'code'        => Inventory::generateCode(),
-                    'material_id' => $request->material_id,
-                    'location_id' => $request->location_id,
-                    'quantity'    => $request->quantity,
-                ]);
-
-                InventoryLog::create([
-                    'movement_code'   => InventoryLog::generateMovementCode(),
-                    'inventory_id'    => $inventory->id,
-                    'material_id'     => $inventory->material_id,
-                    'location_id'     => $inventory->location_id,
-                    'user_id'         => Auth::id(),
-                    'type'            => 'initial',
-                    'quantity_before' => 0,
-                    'quantity_change' => $request->quantity,
-                    'quantity_after'  => $request->quantity,
-                    'remarks'         => $request->remarks,
-                ]);
-
-            } elseif ($request->action === 'adjust') {
-                $inventory = Inventory::findOrFail($request->inventory_id);
-                $before    = (float) $inventory->quantity;
-                $after     = (float) $request->quantity;
-
-                $inventory->update(['quantity' => $after]);
-
-                InventoryLog::create([
-                    'movement_code'   => InventoryLog::generateMovementCode(),
-                    'inventory_id'    => $inventory->id,
-                    'material_id'     => $inventory->material_id,
-                    'location_id'     => $inventory->location_id,
-                    'user_id'         => Auth::id(),
-                    'type'            => 'adjustment',
-                    'quantity_before' => $before,
-                    'quantity_change' => $after - $before,
-                    'quantity_after'  => $after,
-                    'remarks'         => $request->remarks,
-                ]);
-
-            } elseif ($request->action === 'transfer') {
-                $inventory   = Inventory::findOrFail($request->inventory_id);
-                $transferQty = (float) $request->quantity;
-                $before      = (float) $inventory->quantity;
-
-                if ($transferQty > $before) {
-                    abort(422, 'Transfer quantity cannot exceed available stock.');
-                }
-
-                $inventory->update(['quantity' => $before - $transferQty]);
-
-                InventoryLog::create([
-                    'movement_code'        => InventoryLog::generateMovementCode(),
-                    'inventory_id'         => $inventory->id,
-                    'material_id'          => $inventory->material_id,
-                    'location_id'          => $inventory->location_id,
-                    'user_id'              => Auth::id(),
-                    'type'                 => 'transfer_out',
-                    'quantity_before'      => $before,
-                    'quantity_change'      => -$transferQty,
-                    'quantity_after'       => $before - $transferQty,
-                    'transfer_location_id' => $request->transfer_location_id,
-                    'remarks'              => $request->remarks,
-                ]);
-
-                $target = Inventory::withTrashed()
-                    ->where('material_id', $inventory->material_id)
-                    ->where('location_id', $request->transfer_location_id)
-                    ->first();
-
-                if ($target) {
-                    if ($target->trashed()) $target->restore();
-                    $targetBefore = (float) $target->quantity;
-                    $target->update(['quantity' => $targetBefore + $transferQty]);
-                } else {
-                    $targetBefore = 0;
-                    $target = Inventory::create([
-                        'code'        => Inventory::generateCode(),
-                        'material_id' => $inventory->material_id,
-                        'location_id' => $request->transfer_location_id,
-                        'quantity'    => $transferQty,
-                    ]);
-                }
-
-                InventoryLog::create([
-                    'movement_code'        => InventoryLog::generateMovementCode(),
-                    'inventory_id'         => $target->id,
-                    'material_id'          => $inventory->material_id,
-                    'location_id'          => $request->transfer_location_id,
-                    'user_id'              => Auth::id(),
-                    'type'                 => 'transfer_in',
-                    'quantity_before'      => $targetBefore,
-                    'quantity_change'      => $transferQty,
-                    'quantity_after'       => $targetBefore + $transferQty,
-                    'transfer_location_id' => $inventory->location_id,
-                    'remarks'              => $request->remarks,
-                ]);
-            }
-        });
-
-        return redirect()->route('inventories.index')
-            ->with('success', 'Manual adjustment processed successfully.');
+        return redirect()
+            ->route('inventories.index')
+            ->with('success', $data->action->label().' processed successfully.');
     }
 }

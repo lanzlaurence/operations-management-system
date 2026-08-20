@@ -2,785 +2,490 @@
 
 namespace Database\Seeders;
 
+use App\Data\GoodsReceiptData;
+use App\Data\PurchaseOrderData;
 use App\Models\GoodsReceipt;
-use App\Models\GoodsReceiptItem;
-use App\Models\Inventory;
-use App\Models\InventoryLog;
-use App\Models\Material;
 use App\Models\PurchaseOrder;
-use App\Models\PurchaseOrderItem;
-use App\Models\Vendor;
-use App\Models\Location;
-use App\Models\TransactionLog;
-use App\Models\User;
+use App\Services\GoodsReceiptService;
+use App\Services\PurchaseOrderService;
+use Database\Seeders\Concerns\SeedsThroughServices;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Facades\DB;
 
+/**
+ * Sample purchasing data covering every state a purchase order can reach.
+ *
+ * Everything is built through PurchaseOrderService and GoodsReceiptService, so
+ * the totals, the received quantities, the stock movements, the average costs
+ * and the audit trail are exactly what the application would have produced.
+ *
+ * Scenarios seeded:
+ *
+ *   1  draft, single line, VAT exclusive
+ *   2  draft with line discounts, header discount and charges
+ *   3  posted, nothing received yet
+ *   4  posted with a pending receipt (stock reserved, not yet booked)
+ *   5  partially received from one delivery
+ *   6  fully received in one delivery
+ *   7  fully received across two deliveries into two locations
+ *   8  partially received with a second delivery still pending
+ *   9  cancelled straight from posted
+ *  10  cancelled after a completed receipt (stock reversed)
+ *  11  reverted from posted back to draft
+ *  12  cancelled, then reverted back to draft with its receipt reopened
+ *  13  mixed VAT inclusive and exclusive lines with a percentage charge
+ *  14  three lines, two received in full and one partially
+ *  15  large order with serial and batch tracked receipt lines
+ */
 class PurchaseOrderSeeder extends Seeder
 {
+    use SeedsThroughServices;
+
+    public function __construct(
+        private readonly PurchaseOrderService $orders,
+        private readonly GoodsReceiptService $receipts,
+    ) {}
+
     public function run(): void
     {
-        $user      = User::first();
-        $vendors   = Vendor::all();
-        $materials = Material::where('status', 'active')->get();
-        $locations = Location::all();
-
-        $whnMnl = $locations->where('code', 'WH-MNL')->first();
-        $whCeb  = $locations->where('code', 'WH-CEB')->first();
-        $whDav  = $locations->where('code', 'WH-DAV')->first();
-        $dcNth  = $locations->where('code', 'DC-NTH')->first();
-        $hubClk = $locations->where('code', 'HUB-CLK')->first();
-
-        // ── Helpers ────────────────────────────────────────────────────────────
-
-        /**
-         * Build PO totals from a flat list of item arrays.
-         * Each item: [material_id, qty, unit_cost, is_vatable]
-         */
-        $buildPoTotals = function (array $items): array {
-            $totalBefore = 0;
-            $totalVat    = 0;
-
-            foreach ($items as &$item) {
-                $net = round($item['qty'] * $item['unit_cost'], 2);
-                $vat = $item['is_vatable'] ? round($net * 0.12, 2) : 0;
-
-                $item['net_price']  = $net;
-                $item['vat_price']  = $vat;
-                $item['gross_price'] = $net + $vat;
-
-                $totalBefore += $net;
-                $totalVat    += $vat;
-            }
-            unset($item);
-
-            return [
-                'items'                 => $items,
-                'total_before_discount' => $totalBefore,
-                'total_item_discount'   => 0,
-                'total_net_price'       => $totalBefore,
-                'total_vat'             => $totalVat,
-                'total_gross'           => $totalBefore + $totalVat,
-                'total_charges'         => 0,
-                'header_discount_total' => 0,
-                'grand_total'           => $totalBefore + $totalVat,
-            ];
-        };
-
-        /**
-         * Create PO + items, return the PO model.
-         */
-        $createPo = function (
-            array $poData,
-            array $rawItems,
-            string $status
-        ) use ($user, $vendors, $materials, $buildPoTotals): PurchaseOrder {
-
-            $computed = $buildPoTotals($rawItems);
-
-            $po = PurchaseOrder::create([
-                'vendor_id'             => $poData['vendor_id'],
-                'user_id'               => $user->id,
-                'status'                => $status,
-                'order_date'            => $poData['order_date'],
-                'delivery_date'         => $poData['delivery_date'] ?? null,
-                'reference_no'          => $poData['reference_no']  ?? null,
-                'discount_type'         => null,
-                'discount_amount'       => 0,
-                'total_before_discount' => $computed['total_before_discount'],
-                'total_item_discount'   => 0,
-                'total_net_price'       => $computed['total_net_price'],
-                'total_vat'             => $computed['total_vat'],
-                'total_gross'           => $computed['total_gross'],
-                'total_charges'         => 0,
-                'header_discount_total' => 0,
-                'grand_total'           => $computed['grand_total'],
-                'remarks'               => $poData['remarks'] ?? null,
-            ]);
-
-            foreach ($computed['items'] as $line => $item) {
-                PurchaseOrderItem::create([
-                    'purchase_order_id'        => $po->id,
-                    'material_id'              => $item['material_id'],
-                    'line_number'              => $line + 1,
-                    'qty_ordered'              => $item['qty'],
-                    'qty_received'             => $item['qty_received'] ?? 0,
-                    'unit_cost'               => $item['unit_cost'],
-                    'discount_type'            => null,
-                    'discount_amount'          => 0,
-                    'unit_cost_after_discount' => $item['unit_cost'],
-                    'net_price'                => $item['net_price'],
-                    'is_vatable'               => $item['is_vatable'],
-                    'vat_type'                 => $item['is_vatable'] ? 'inclusive' : null,
-                    'vat_rate'                 => $item['is_vatable'] ? 12 : 0,
-                    'vat_price'                => $item['vat_price'],
-                    'gross_price'              => $item['gross_price'],
-                    'remarks'                  => $item['remarks'] ?? null,
-                ]);
-            }
-
-            return $po;
-        };
-
-        /**
-         * Create a GR + its items; optionally complete it (updates inventory).
-         */
-        $createGr = function (
-            PurchaseOrder $po,
-            array $grLines,       // [purchase_order_item_id => qty_to_receive]
-            Location $location,
-            string $grStatus,
-            string $grDate,
-            string $remarks = ''
-        ) use ($user, $materials): GoodsReceipt {
-
-            $gr = GoodsReceipt::create([
-                'purchase_order_id' => $po->id,
-                'user_id'           => $user->id,
-                'location_id'       => $location->id,
-                'status'            => $grStatus,
-                'gr_date'           => $grDate,
-                'transaction_date'  => $grDate,
-                'remarks'           => $remarks,
-            ]);
-
-            TransactionLog::create([
-                'user_id'       => $user->id,
-                'action'        => 'created',
-                'from_status'   => null,
-                'to_status'     => 'pending',
-                'loggable_id'   => $gr->id,
-                'loggable_type' => GoodsReceipt::class,
-            ]);
-
-            foreach ($grLines as $poItemId => $qtyToReceive) {
-                $poItem = PurchaseOrderItem::find($poItemId);
-
-                GoodsReceiptItem::create([
-                    'goods_receipt_id'      => $gr->id,
-                    'purchase_order_item_id' => $poItemId,
-                    'material_id'           => $poItem->material_id,
-                    'qty_ordered'           => $poItem->qty_ordered,
-                    'qty_received'          => $poItem->qty_received,
-                    'qty_to_receive'        => $qtyToReceive,
-                    'qty_remaining'         => $poItem->qty_ordered - $poItem->qty_received - $qtyToReceive,
-                    'unit_cost'             => $poItem->unit_cost,
-                ]);
-            }
-
-            // ── Complete GR: update inventory + PO item qty_received ───────────
-            if ($grStatus === 'completed') {
-                $this->completeGr($gr, $user);
-            }
-
-            // ── Cancel GR ─────────────────────────────────────────────────────
-            if ($grStatus === 'cancelled') {
-                TransactionLog::create([
-                    'user_id'       => $user->id,
-                    'action'        => 'cancelled',
-                    'from_status'   => 'pending',
-                    'to_status'     => 'cancelled',
-                    'loggable_id'   => $gr->id,
-                    'loggable_type' => GoodsReceipt::class,
-                ]);
-            }
-
-            return $gr;
-        };
-
-        // ── PO 1: Draft – not yet posted ───────────────────────────────────────
-        // Scenario: PO created and saved as draft, no further action taken.
-        $createPo([
-            'vendor_id'    => $vendors->where('code', '200001')->first()->id,
-            'order_date'   => '2026-01-05',
-            'delivery_date'=> '2026-01-20',
-            'reference_no' => 'REF-2026-001',
-            'remarks'      => 'Draft PO for steel rods – pending approval',
-        ], [
-            ['material_id' => $materials->where('code', '300001')->first()->id, 'qty' => 100, 'unit_cost' => 250.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300013')->first()->id, 'qty' => 50,  'unit_cost' => 180.00, 'is_vatable' => true],
-        ], 'draft');
-
-        // ── PO 2: Draft – multiple items, not posted ───────────────────────────
-        // Scenario: Larger draft PO covering several materials.
-        $createPo([
-            'vendor_id'    => $vendors->where('code', '200002')->first()->id,
-            'order_date'   => '2026-01-08',
-            'delivery_date'=> '2026-01-25',
-            'reference_no' => 'REF-2026-002',
-            'remarks'      => 'Bulk order for site materials',
-        ], [
-            ['material_id' => $materials->where('code', '300002')->first()->id, 'qty' => 200, 'unit_cost' => 180.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300003')->first()->id, 'qty' => 50,  'unit_cost' => 650.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300007')->first()->id, 'qty' => 80,  'unit_cost' => 120.00, 'is_vatable' => false],
-        ], 'draft');
-
-        // ── PO 3: Posted – awaiting goods receipt ──────────────────────────────
-        // Scenario: PO approved and posted; vendor has not delivered yet.
-        $po3 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200003')->first()->id,
-            'order_date'   => '2026-01-10',
-            'delivery_date'=> '2026-01-28',
-            'reference_no' => 'REF-2026-003',
-            'remarks'      => 'Hardware order – awaiting delivery',
-        ], [
-            ['material_id' => $materials->where('code', '300001')->first()->id, 'qty' => 150, 'unit_cost' => 248.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300005')->first()->id, 'qty' => 60,  'unit_cost' => 850.00, 'is_vatable' => true],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po3->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        // ── PO 4: Posted – another open PO ────────────────────────────────────
-        // Scenario: Posted, vendor acknowledged; delivery scheduled next week.
-        $po4 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200004')->first()->id,
-            'order_date'   => '2026-01-12',
-            'delivery_date'=> '2026-02-05',
-            'reference_no' => 'REF-2026-004',
-        ], [
-            ['material_id' => $materials->where('code', '300002')->first()->id, 'qty' => 300, 'unit_cost' => 178.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300008')->first()->id, 'qty' => 15,  'unit_cost' => 800.00, 'is_vatable' => false],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po4->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        // ── PO 5: Partially received – first shipment done ─────────────────────
-        // Scenario: PO for 200 cement bags; first GR of 120 completed; 80 still open.
-        $po5 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200004')->first()->id,
-            'order_date'   => '2026-01-15',
-            'delivery_date'=> '2026-02-01',
-            'reference_no' => 'REF-2026-005',
-            'remarks'      => 'Cement – split delivery arrangement',
-        ], [
-            ['material_id'    => $materials->where('code', '300002')->first()->id,
-             'qty'            => 200,
-             'unit_cost'      => 180.00,
-             'is_vatable'     => true,
-             'qty_received'   => 120],
-            ['material_id'    => $materials->where('code', '300012')->first()->id,
-             'qty'            => 20,
-             'unit_cost'      => 600.00,
-             'is_vatable'     => false,
-             'qty_received'   => 20],
-        ], 'partially_received');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po5->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po5Items = $po5->items()->get();
-
-        $gr5a = $createGr(
-            $po5,
-            [
-                $po5Items[0]->id => 120,  // partial on cement
-                $po5Items[1]->id => 20,   // full on sand
-            ],
-            $whnMnl,
-            'completed',
-            '2026-01-22',
-            'First delivery – partial cement, full sand'
-        );
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr5a->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        // ── PO 6: Fully received – all items received in one GR ───────────────
-        // Scenario: Clean single-delivery PO; fully received at Manila Warehouse.
-        $po6 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200007')->first()->id,
-            'order_date'   => '2026-01-18',
-            'delivery_date'=> '2026-02-03',
-            'reference_no' => 'REF-2026-006',
-            'remarks'      => 'Electrical wire – full delivery expected',
-        ], [
-            ['material_id'  => $materials->where('code', '300005')->first()->id,
-             'qty'          => 100,
-             'unit_cost'    => 848.00,
-             'is_vatable'   => true,
-             'qty_received' => 100],
-        ], 'fully_received');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po6->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po6Items = $po6->items()->get();
-
-        $gr6 = $createGr(
-            $po6,
-            [$po6Items[0]->id => 100],
-            $whnMnl,
-            'completed',
-            '2026-02-03',
-            'Full delivery received – all wire cable'
-        );
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr6->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        // ── PO 7: Fully received – two GRs (split delivery) ───────────────────
-        // Scenario: PO of 80 plywood sheets; delivered in two batches of 40 each.
-        $po7 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200005')->first()->id,
-            'order_date'   => '2026-01-20',
-            'delivery_date'=> '2026-02-10',
-            'reference_no' => 'REF-2026-007',
-            'remarks'      => 'Plywood – two truck loads',
-        ], [
-            ['material_id'  => $materials->where('code', '300003')->first()->id,
-             'qty'          => 80,
-             'unit_cost'    => 648.00,
-             'is_vatable'   => true,
-             'qty_received' => 80],
-        ], 'fully_received');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po7->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po7Items = $po7->items()->get();
-
-        // First GR – 40 sheets
-        $gr7a = $createGr(
-            $po7,
-            [$po7Items[0]->id => 40],
-            $whnMnl,
-            'completed',
-            '2026-02-05',
-            'First truck – 40 plywood sheets'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr7a->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        // Second GR – remaining 40 sheets
-        $po7Items[0]->refresh();
-        $gr7b = $createGr(
-            $po7,
-            [$po7Items[0]->id => 40],
-            $whnMnl,
-            'completed',
-            '2026-02-10',
-            'Second truck – remaining 40 plywood sheets'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr7b->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        // ── PO 8: Partially received – pending GR still open ──────────────────
-        // Scenario: Tiles PO; partial GR completed; another GR still pending.
-        $po8 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200008')->first()->id,
-            'order_date'   => '2026-01-22',
-            'delivery_date'=> '2026-02-15',
-            'reference_no' => 'REF-2026-008',
-            'remarks'      => 'Ceramic tiles – staggered delivery',
-        ], [
-            ['material_id'  => $materials->where('code', '300006')->first()->id,
-             'qty'          => 800,
-             'unit_cost'    => 44.00,
-             'is_vatable'   => true,
-             'qty_received' => 500],
-        ], 'partially_received');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po8->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po8Items = $po8->items()->get();
-
-        $gr8completed = $createGr(
-            $po8,
-            [$po8Items[0]->id => 500],
-            $whDav,
-            'completed',
-            '2026-02-05',
-            'First tile delivery to Davao'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr8completed->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        $po8Items[0]->refresh();
-        // Pending GR for the remaining 300 tiles
-        $createGr(
-            $po8,
-            [$po8Items[0]->id => 300],
-            $whDav,
-            'pending',
-            '2026-02-15',
-            'Second tile delivery – pending vendor confirmation'
-        );
-
-        // ── PO 9: Cancelled PO – before any GR ───────────────────────────────
-        // Scenario: PO posted but vendor couldn't fulfill; cancelled directly.
-        $po9 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200009')->first()->id,
-            'order_date'   => '2026-01-25',
-            'delivery_date'=> '2026-02-20',
-            'reference_no' => 'REF-2026-009',
-            'remarks'      => 'Plumbing supplies – vendor cancelled due to stock shortage',
-        ], [
-            ['material_id' => $materials->where('code', '300007')->first()->id, 'qty' => 200, 'unit_cost' => 119.00, 'is_vatable' => true],
-        ], 'cancelled');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po9->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'cancelled',
-            'from_status'   => 'posted',
-            'to_status'     => 'cancelled',
-            'remarks'       => 'Vendor unable to supply – cancelled',
-            'loggable_id'   => $po9->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        // ── PO 10: Cancelled – had a completed GR then cancelled ──────────────
-        // Scenario: Partial GR was completed, then remaining was cancelled (vendor issue).
-        $po10 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200010')->first()->id,
-            'order_date'   => '2026-01-28',
-            'delivery_date'=> '2026-02-12',
-            'reference_no' => 'REF-2026-010',
-            'remarks'      => 'Aggregate order – partially delivered then cancelled',
-        ], [
-            ['material_id'  => $materials->where('code', '300008')->first()->id,
-             'qty'          => 20,
-             'unit_cost'    => 798.00,
-             'is_vatable'   => false,
-             'qty_received' => 8],
-        ], 'cancelled');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po10->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po10Items = $po10->items()->get();
-
-        $gr10 = $createGr(
-            $po10,
-            [$po10Items[0]->id => 8],
-            $hubClk,
-            'completed',
-            '2026-02-05',
-            'Partial gravel delivery – 8 of 20 cubic meters'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr10->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'cancelled',
-            'from_status'   => 'partially_received',
-            'to_status'     => 'cancelled',
-            'remarks'       => 'Vendor unable to fulfill remaining 12 units',
-            'loggable_id'   => $po10->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        // ── PO 11: GR created then cancelled, PO reverted to posted ──────────
-        // Scenario: GR was made by mistake; cancelled and PO back to posted.
-        $po11 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200011')->first()->id,
-            'order_date'   => '2026-02-01',
-            'delivery_date'=> '2026-02-20',
-            'reference_no' => 'REF-2026-011',
-            'remarks'      => 'Metalworks order – GR cancelled, awaiting re-delivery',
-        ], [
-            ['material_id' => $materials->where('code', '300009')->first()->id, 'qty' => 30, 'unit_cost' => 1848.00, 'is_vatable' => true],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po11->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po11Items = $po11->items()->get();
-
-        // Pending GR – created then cancelled (wrong quantities entered)
-        $gr11 = $createGr(
-            $po11,
-            [$po11Items[0]->id => 30],
-            $dcNth,
-            'cancelled',
-            '2026-02-12',
-            'Cancelled – wrong batch entered; re-delivery scheduled'
-        );
-
-        // ── PO 12: Multi-item, fully received at Cebu ─────────────────────────
-        // Scenario: Cebu warehouse restocking; all items received.
-        $po12 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200001')->first()->id,
-            'order_date'   => '2026-02-05',
-            'delivery_date'=> '2026-02-25',
-            'reference_no' => 'REF-2026-012',
-            'remarks'      => 'Cebu warehouse monthly restocking',
-        ], [
-            ['material_id'  => $materials->where('code', '300001')->first()->id,
-             'qty'          => 80,
-             'unit_cost'    => 250.00,
-             'is_vatable'   => true,
-             'qty_received' => 80],
-            ['material_id'  => $materials->where('code', '300002')->first()->id,
-             'qty'          => 150,
-             'unit_cost'    => 180.00,
-             'is_vatable'   => true,
-             'qty_received' => 150],
-        ], 'fully_received');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po12->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po12Items = $po12->items()->get();
-
-        $gr12 = $createGr(
-            $po12,
-            [
-                $po12Items[0]->id => 80,
-                $po12Items[1]->id => 150,
-            ],
-            $whCeb,
-            'completed',
-            '2026-02-22',
-            'Full restocking delivery to Cebu warehouse'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr12->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        // ── PO 13: Posted – multi-item with no delivery date ──────────────────
-        // Scenario: Posted PO with open-ended delivery; vendor to advise.
-        $po13 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200012')->first()->id,
-            'order_date'   => '2026-02-10',
-            'delivery_date'=> null,
-            'reference_no' => 'REF-2026-013',
-            'remarks'      => 'Glass panels – delivery date TBD per vendor lead time',
-        ], [
-            ['material_id' => $materials->where('code', '300010')->first()->id, 'qty' => 40, 'unit_cost' => 1195.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300009')->first()->id, 'qty' => 25, 'unit_cost' => 1848.00, 'is_vatable' => true],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po13->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        // ── PO 14: Partially received – three-item PO, two fully, one partial ─
-        // Scenario: Mixed receipt; lumber fully received, nails fully received,
-        //           concrete blocks only half arrived.
-        $po14 = $createPo([
-            'vendor_id'    => $vendors->where('code', '200013')->first()->id,
-            'order_date'   => '2026-02-12',
-            'delivery_date'=> '2026-03-01',
-            'reference_no' => 'REF-2026-014',
-            'remarks'      => 'Masonry & carpentry supplies',
-        ], [
-            ['material_id'  => $materials->where('code', '300014')->first()->id,
-             'qty'          => 100,
-             'unit_cost'    => 244.00,
-             'is_vatable'   => true,
-             'qty_received' => 100],
-            ['material_id'  => $materials->where('code', '300013')->first()->id,
-             'qty'          => 30,
-             'unit_cost'    => 178.00,
-             'is_vatable'   => false,
-             'qty_received' => 30],
-            ['material_id'  => $materials->where('code', '300011')->first()->id,
-             'qty'          => 400,
-             'unit_cost'    => 27.50,
-             'is_vatable'   => false,
-             'qty_received' => 200],
-        ], 'partially_received');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $po14->id,
-            'loggable_type' => PurchaseOrder::class,
-        ]);
-
-        $po14Items = $po14->items()->get();
-
-        $gr14 = $createGr(
-            $po14,
-            [
-                $po14Items[0]->id => 100,
-                $po14Items[1]->id => 30,
-                $po14Items[2]->id => 200,
-            ],
-            $dcNth,
-            'completed',
-            '2026-02-25',
-            'First delivery: lumber & nails full, concrete blocks partial'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gr14->id,
-            'loggable_type' => GoodsReceipt::class,
-        ]);
-
-        // ── PO 15: Draft – recently created, no action taken yet ──────────────
-        // Scenario: Latest PO in the queue; still being reviewed before posting.
-        $createPo([
-            'vendor_id'    => $vendors->where('code', '200015')->first()->id,
-            'order_date'   => '2026-03-01',
-            'delivery_date'=> '2026-03-20',
-            'reference_no' => 'REF-2026-015',
-            'remarks'      => 'Insulation roll restock – draft under review',
-        ], [
-            ['material_id' => $materials->where('code', '300004')->first()->id, 'qty' => 60,  'unit_cost' => 1198.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300006')->first()->id, 'qty' => 300, 'unit_cost' => 44.50,   'is_vatable' => true],
-        ], 'draft');
+        $this->asAdministrator(function (): void {
+            $this->draftOrders();
+            $this->postedOrders();
+            $this->receivedOrders();
+            $this->cancelledAndRevertedOrders();
+        });
     }
 
-    // ── Internal: complete a GR (update inventory + PO item qty_received) ─────
+    // ── Scenario groups ──────────────────────────────────────────────────────
 
-    private function completeGr(GoodsReceipt $gr, $user): void
+    private function draftOrders(): void
     {
-        foreach ($gr->items as $item) {
-            $poItem = $item->purchaseOrderItem;
+        // 1 - the simplest possible order, still being prepared.
+        $this->createOrder([
+            'vendor' => '200001',
+            'order_date' => $this->daysAgo(3),
+            'delivery_date' => $this->daysAhead(11),
+            'reference_no' => 'PR-2001',
+            'remarks' => 'Steel restock for the Manila warehouse - awaiting approval.',
+            'items' => [
+                ['material' => '300001', 'qty' => 120, 'unit_cost' => 250, 'vat' => 'exclusive'],
+            ],
+        ]);
 
-            // Update PO item qty_received
-            $poItem->increment('qty_received', $item->qty_to_receive);
+        // 2 - discounts on the lines, a discount on the header and two charges.
+        $this->createOrder([
+            'vendor' => '200002',
+            'order_date' => $this->daysAgo(2),
+            'delivery_date' => $this->daysAhead(14),
+            'reference_no' => 'PR-2002',
+            'remarks' => 'Negotiated pricing: 5% off cement, PHP 15 off per bag of sand.',
+            'discount' => ['percentage', 2.5],
+            'charges' => ['Delivery Charge', 'Handling Fee'],
+            'items' => [
+                ['material' => '300002', 'qty' => 400, 'unit_cost' => 180, 'vat' => 'exclusive', 'discount' => ['percentage', 5]],
+                ['material' => '300006', 'qty' => 600, 'unit_cost' => 44.5, 'vat' => 'exclusive', 'discount' => ['fixed', 1.5]],
+                ['material' => '300011', 'qty' => 250, 'unit_cost' => 27.5, 'remarks' => 'Non-vatable local supplier.'],
+            ],
+        ]);
 
-            // Upsert inventory
-            $inventory = Inventory::firstOrCreate(
-                [
-                    'material_id' => $item->material_id,
-                    'location_id' => $gr->location_id,
-                ],
-                [
-                    'code'     => Inventory::generateCode(),
-                    'quantity' => 0,
-                ]
-            );
+        // 15 - a large draft that will later be received with serials/batches.
+        $this->createOrder([
+            'vendor' => '200015',
+            'order_date' => $this->daysAgo(1),
+            'delivery_date' => $this->daysAhead(20),
+            'reference_no' => 'PR-2015',
+            'remarks' => 'Insulation and fixtures - draft under review.',
+            'items' => [
+                ['material' => '300004', 'qty' => 60, 'unit_cost' => 1198, 'vat' => 'exclusive'],
+                ['material' => '300010', 'qty' => 40, 'unit_cost' => 1195, 'vat' => 'inclusive'],
+            ],
+        ]);
+    }
 
-            $before = (float) $inventory->quantity;
-            $change = (float) $item->qty_to_receive;
-            $after  = $before + $change;
+    private function postedOrders(): void
+    {
+        // 3 - posted and waiting on the vendor, no receipt raised yet.
+        $order = $this->createOrder([
+            'vendor' => '200003',
+            'order_date' => $this->daysAgo(12),
+            'delivery_date' => $this->daysAhead(6),
+            'reference_no' => 'PR-2003',
+            'remarks' => 'Plywood order confirmed with the vendor.',
+            'items' => [
+                ['material' => '300003', 'qty' => 150, 'unit_cost' => 620, 'vat' => 'exclusive'],
+                ['material' => '300005', 'qty' => 90, 'unit_cost' => 385, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
 
-            $inventory->update(['quantity' => $after]);
+        // 4 - posted with a receipt prepared but not yet completed: the
+        //     quantities are reserved, no stock has moved.
+        $order = $this->createOrder([
+            'vendor' => '200004',
+            'order_date' => $this->daysAgo(10),
+            'delivery_date' => $this->daysAhead(4),
+            'reference_no' => 'PR-2004',
+            'remarks' => 'Delivery arriving in two batches.',
+            'charges' => ['Delivery Charge'],
+            'items' => [
+                ['material' => '300007', 'qty' => 200, 'unit_cost' => 95, 'vat' => 'exclusive'],
+                ['material' => '300012', 'qty' => 40, 'unit_cost' => 2450, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(1),
+            'remarks' => 'First batch checked in at the gate, pending QC sign-off.',
+            'lines' => ['300007' => 120],
+        ]);
 
-            InventoryLog::create([
-                'movement_code'  => InventoryLog::generateMovementCode(),
-                'inventory_id'   => $inventory->id,
-                'material_id'    => $item->material_id,
-                'location_id'    => $gr->location_id,
-                'user_id'        => $user->id,
-                'type'           => 'purchase_receipt',
-                'quantity_before'=> $before,
-                'quantity_change'=> $change,
-                'quantity_after' => $after,
-                'reference_id'   => $gr->id,
-                'reference_type' => GoodsReceipt::class,
-                'remarks'        => 'Goods receipt: ' . $gr->code,
-            ]);
+        // 13 - mixed VAT treatment plus a percentage service charge.
+        $order = $this->createOrder([
+            'vendor' => '200005',
+            'order_date' => $this->daysAgo(9),
+            'delivery_date' => $this->daysAhead(8),
+            'reference_no' => 'PR-2013',
+            'remarks' => 'Mixed VAT treatment: fixtures inclusive, hardware exclusive.',
+            'charges' => ['Service Charge (5%)', 'Bulk Order Discount (10%)'],
+            'items' => [
+                ['material' => '300009', 'qty' => 30, 'unit_cost' => 1848, 'vat' => 'inclusive'],
+                ['material' => '300008', 'qty' => 25, 'unit_cost' => 3150, 'vat' => 'exclusive', 'discount' => ['percentage', 3]],
+                ['material' => '300013', 'qty' => 80, 'unit_cost' => 178],
+            ],
+        ]);
+        $this->orders->post($order);
+    }
+
+    private function receivedOrders(): void
+    {
+        // 5 - one delivery covering part of the order.
+        $order = $this->createOrder([
+            'vendor' => '200006',
+            'order_date' => $this->daysAgo(24),
+            'delivery_date' => $this->daysAgo(4),
+            'reference_no' => 'PR-2005',
+            'remarks' => 'Vendor short-shipped the first delivery.',
+            'items' => [
+                ['material' => '300001', 'qty' => 200, 'unit_cost' => 248, 'vat' => 'exclusive'],
+                ['material' => '300002', 'qty' => 300, 'unit_cost' => 178, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(6),
+            'complete' => true,
+            'remarks' => 'Partial delivery: steel complete, cement short by 100 bags.',
+            'lines' => ['300001' => 200, '300002' => 200],
+        ]);
+
+        // 6 - straightforward full delivery.
+        $order = $this->createOrder([
+            'vendor' => '200007',
+            'order_date' => $this->daysAgo(30),
+            'delivery_date' => $this->daysAgo(18),
+            'reference_no' => 'PR-2006',
+            'remarks' => 'Monthly Cebu restock.',
+            'charges' => ['Delivery Charge'],
+            'items' => [
+                ['material' => '300001', 'qty' => 80, 'unit_cost' => 252, 'vat' => 'exclusive'],
+                ['material' => '300002', 'qty' => 150, 'unit_cost' => 181, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-CEB',
+            'date' => $this->daysAgo(18),
+            'complete' => true,
+            'remarks' => 'Full delivery received in Cebu.',
+            'lines' => ['300001' => 80, '300002' => 150],
+        ]);
+
+        // 7 - two deliveries into two different locations complete the order.
+        $order = $this->createOrder([
+            'vendor' => '200008',
+            'order_date' => $this->daysAgo(28),
+            'delivery_date' => $this->daysAgo(10),
+            'reference_no' => 'PR-2007',
+            'remarks' => 'Split delivery: half to the north DC, half to Clark.',
+            'items' => [
+                ['material' => '300006', 'qty' => 800, 'unit_cost' => 43.5, 'vat' => 'exclusive'],
+                ['material' => '300011', 'qty' => 400, 'unit_cost' => 27],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'DC-NTH',
+            'date' => $this->daysAgo(20),
+            'complete' => true,
+            'remarks' => 'First half delivered to the north distribution centre.',
+            'lines' => ['300006' => 400, '300011' => 200],
+        ]);
+        $this->receive($order, [
+            'location' => 'HUB-CLK',
+            'date' => $this->daysAgo(10),
+            'complete' => true,
+            'remarks' => 'Second half delivered to the Clark hub.',
+            'lines' => ['300006' => 400, '300011' => 200],
+        ]);
+
+        // 8 - part received, part still on a pending receipt.
+        $order = $this->createOrder([
+            'vendor' => '200009',
+            'order_date' => $this->daysAgo(16),
+            'delivery_date' => $this->daysAhead(3),
+            'reference_no' => 'PR-2008',
+            'remarks' => 'Tiles arriving in stages.',
+            'items' => [
+                ['material' => '300014', 'qty' => 300, 'unit_cost' => 244, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(8),
+            'complete' => true,
+            'remarks' => 'First pallet batch received.',
+            'lines' => ['300014' => 120],
+        ]);
+        $this->receive($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(1),
+            'remarks' => 'Second batch on the dock, awaiting inspection.',
+            'lines' => ['300014' => 100],
+        ]);
+
+        // 14 - three lines: two complete, one short.
+        $order = $this->createOrder([
+            'vendor' => '200013',
+            'order_date' => $this->daysAgo(21),
+            'delivery_date' => $this->daysAgo(5),
+            'reference_no' => 'PR-2014',
+            'remarks' => 'Masonry and carpentry supplies.',
+            'charges' => ['Handling Fee'],
+            'items' => [
+                ['material' => '300014', 'qty' => 100, 'unit_cost' => 244, 'vat' => 'exclusive'],
+                ['material' => '300013', 'qty' => 30, 'unit_cost' => 178],
+                ['material' => '300011', 'qty' => 400, 'unit_cost' => 27.5],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'DC-NTH',
+            'date' => $this->daysAgo(5),
+            'complete' => true,
+            'remarks' => 'Lumber and nails complete, blocks half delivered.',
+            'lines' => ['300014' => 100, '300013' => 30, '300011' => 200],
+        ]);
+
+        // 15b - receipt carrying serial and batch references.
+        $order = $this->createOrder([
+            'vendor' => '200010',
+            'order_date' => $this->daysAgo(26),
+            'delivery_date' => $this->daysAgo(12),
+            'reference_no' => 'PR-2010',
+            'remarks' => 'Serial tracked equipment and batch tracked adhesive.',
+            'items' => [
+                ['material' => '300012', 'qty' => 12, 'unit_cost' => 2450, 'vat' => 'exclusive'],
+                ['material' => '300015', 'qty' => 90, 'unit_cost' => 320, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(12),
+            'complete' => true,
+            'remarks' => 'Serials logged by the warehouse team.',
+            'lines' => [
+                '300012' => ['qty' => 12, 'serial_number' => 'SN-2450-0001..0012', 'remarks' => 'Serials verified against the packing list.'],
+                '300015' => ['qty' => 90, 'batch_number' => 'BATCH-A7734', 'remarks' => 'Batch expires in 18 months.'],
+            ],
+        ]);
+    }
+
+    private function cancelledAndRevertedOrders(): void
+    {
+        // 9 - cancelled before anything was received.
+        $order = $this->createOrder([
+            'vendor' => '200011',
+            'order_date' => $this->daysAgo(19),
+            'delivery_date' => $this->daysAgo(2),
+            'reference_no' => 'PR-2011',
+            'remarks' => 'Cancelled: vendor could not meet the delivery window.',
+            'items' => [
+                ['material' => '300005', 'qty' => 60, 'unit_cost' => 390, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->orders->cancel($order);
+
+        // 10 - received, then cancelled: the receipt is cancelled with the
+        //      order and its stock is booked back out.
+        $order = $this->createOrder([
+            'vendor' => '200012',
+            'order_date' => $this->daysAgo(23),
+            'delivery_date' => $this->daysAgo(9),
+            'reference_no' => 'PR-2012',
+            'remarks' => 'Delivered goods rejected by QC and returned to the vendor.',
+            'items' => [
+                ['material' => '300007', 'qty' => 100, 'unit_cost' => 96, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-DAV',
+            'date' => $this->daysAgo(14),
+            'complete' => true,
+            'remarks' => 'Received, later found to be out of specification.',
+            'lines' => ['300007' => 100],
+        ]);
+        $this->orders->cancel($order);
+
+        // 11 - posted, then pulled back to draft for a price correction.
+        $order = $this->createOrder([
+            'vendor' => '200014',
+            'order_date' => $this->daysAgo(7),
+            'delivery_date' => $this->daysAhead(9),
+            'reference_no' => 'PR-2009',
+            'remarks' => 'Reverted to draft: unit costs to be renegotiated.',
+            'items' => [
+                ['material' => '300003', 'qty' => 70, 'unit_cost' => 640, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->orders->revert($order);
+
+        // 12 - cancelled, then brought back: the pending receipt is reopened
+        //      together with the order.
+        $order = $this->createOrder([
+            'vendor' => '200002',
+            'order_date' => $this->daysAgo(15),
+            'delivery_date' => $this->daysAhead(5),
+            'reference_no' => 'PR-2016',
+            'remarks' => 'Cancelled in error, restored after the vendor confirmed.',
+            'items' => [
+                ['material' => '300002', 'qty' => 200, 'unit_cost' => 179, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->receive($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(2),
+            'remarks' => 'Prepared receipt, held while the order was disputed.',
+            'lines' => ['300002' => 200],
+        ]);
+        $this->orders->cancel($order);
+        $this->orders->revert($order);
+    }
+
+    // ── Builders ─────────────────────────────────────────────────────────────
+
+    /**
+     * Create one draft order from a scenario description.
+     *
+     * @param  array<string, mixed>  $spec
+     */
+    private function createOrder(array $spec): PurchaseOrder
+    {
+        [$discountType, $discountAmount] = $spec['discount'] ?? [null, 0];
+
+        return $this->orders->create(PurchaseOrderData::fromArray([
+            'vendor_id' => $this->vendorId($spec['vendor']),
+            'order_date' => $spec['order_date'],
+            'delivery_date' => $spec['delivery_date'] ?? null,
+            'reference_no' => $spec['reference_no'] ?? null,
+            'discount_type' => $discountType,
+            'discount_amount' => $discountAmount,
+            'remarks' => $spec['remarks'] ?? null,
+            'items' => $this->itemRows($spec['items']),
+            'charges' => $this->chargeRows($spec['charges'] ?? []),
+        ]));
+    }
+
+    /**
+     * Item payload rows, resolving material codes and VAT shorthand.
+     *
+     * @param  array<int, array<string, mixed>>  $items
+     * @return array<int, array<string, mixed>>
+     */
+    private function itemRows(array $items): array
+    {
+        $rows = [];
+
+        foreach ($items as $item) {
+            $materialId = $this->materialId($item['material']);
+
+            if ($materialId === null) {
+                continue;
+            }
+
+            [$discountType, $discountAmount] = $item['discount'] ?? [null, 0];
+
+            $rows[] = [
+                'material_id' => $materialId,
+                'qty_ordered' => $item['qty'],
+                'unit_cost' => $item['unit_cost'],
+                'discount_type' => $discountType,
+                'discount_amount' => $discountAmount,
+                'is_vatable' => isset($item['vat']),
+                'vat_type' => $item['vat'] ?? null,
+                'vat_rate' => isset($item['vat']) ? 12 : 0,
+                'remarks' => $item['remarks'] ?? null,
+            ];
         }
+
+        return $rows;
+    }
+
+    /**
+     * Raise a receipt against an order and optionally complete it.
+     *
+     * `lines` maps a material code to either a plain quantity or an array with
+     * the quantity plus serial/batch/remarks.
+     *
+     * @param  array<string, mixed>  $spec
+     */
+    private function receive(PurchaseOrder $order, array $spec): ?GoodsReceipt
+    {
+        $order->refresh()->load('items');
+
+        $items = [];
+
+        foreach ($spec['lines'] as $materialCode => $line) {
+            $orderItem = $order->items->firstWhere('material_id', $this->materialId($materialCode));
+
+            if ($orderItem === null) {
+                continue;
+            }
+
+            $line = is_array($line) ? $line : ['qty' => $line];
+
+            $items[] = [
+                'purchase_order_item_id' => $orderItem->id,
+                'qty_to_receive' => $line['qty'],
+                'serial_number' => $line['serial_number'] ?? null,
+                'batch_number' => $line['batch_number'] ?? null,
+                'remarks' => $line['remarks'] ?? null,
+            ];
+        }
+
+        if ($items === []) {
+            return null;
+        }
+
+        $receipt = $this->receipts->create($order, GoodsReceiptData::fromArray([
+            'purchase_order_id' => $order->id,
+            'location_id' => $this->locationId($spec['location']),
+            'gr_date' => $spec['date'],
+            'transaction_date' => $spec['date'],
+            'remarks' => $spec['remarks'] ?? null,
+            'items' => $items,
+        ]));
+
+        if ($spec['complete'] ?? false) {
+            $receipt = $this->receipts->complete($receipt);
+        }
+
+        return $receipt;
     }
 }

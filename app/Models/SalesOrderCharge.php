@@ -2,9 +2,20 @@
 
 namespace App\Models;
 
+use App\Enums\ChargeType;
+use App\Enums\ChargeValueType;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
+/**
+ * A charge attached to a sales order.
+ *
+ * Name, type and value are snapshotted from the master charge at the time the
+ * order was saved, so editing the master record never rewrites posted orders.
+ *
+ * @property ChargeType $type
+ * @property ChargeValueType $value_type
+ */
 class SalesOrderCharge extends Model
 {
     protected $fillable = [
@@ -12,11 +23,29 @@ class SalesOrderCharge extends Model
         'type', 'value_type', 'value', 'computed_amount',
     ];
 
-    protected $casts = [
-        'value'           => 'decimal:2',
-        'computed_amount' => 'decimal:2',
-    ];
+    protected function casts(): array
+    {
+        return [
+            'type' => ChargeType::class,
+            'value_type' => ChargeValueType::class,
+            'value' => 'decimal:2',
+            'computed_amount' => 'decimal:2',
+        ];
+    }
 
-    public function salesOrder(): BelongsTo { return $this->belongsTo(SalesOrder::class); }
-    public function charge(): BelongsTo     { return $this->belongsTo(Charge::class); }
+    public function salesOrder(): BelongsTo
+    {
+        return $this->belongsTo(SalesOrder::class);
+    }
+
+    public function charge(): BelongsTo
+    {
+        return $this->belongsTo(Charge::class);
+    }
+
+    /** Amount signed the way it lands in the grand total. */
+    public function signedAmount(): float
+    {
+        return $this->type->sign() * (float) $this->computed_amount;
+    }
 }

@@ -3,14 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Http\Requests\UpdatePreferenceRequest;
-use App\Models\Preference;
 use App\Models\Currency;
+use App\Models\Preference;
 use App\Traits\HandlesFileUpload;
-use Illuminate\Http\Request;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Routing\Controllers\HasMiddleware;
 use Illuminate\Routing\Controllers\Middleware;
 use Illuminate\Support\Facades\Storage;
 use Inertia\Inertia;
+use Inertia\Response;
 
 class PreferenceController extends Controller implements HasMiddleware
 {
@@ -24,7 +25,7 @@ class PreferenceController extends Controller implements HasMiddleware
         ];
     }
 
-    public function index()
+    public function index(): Response
     {
         $formData = [
             'app_name' => Preference::get('app_name', 'Operations Management System'),
@@ -47,7 +48,7 @@ class PreferenceController extends Controller implements HasMiddleware
         ]);
     }
 
-    public function update(UpdatePreferenceRequest $request)
+    public function update(UpdatePreferenceRequest $request): RedirectResponse
     {
         Preference::set('app_name', $request->app_name);
         Preference::set('decimal_places', $request->decimal_places, 'number');

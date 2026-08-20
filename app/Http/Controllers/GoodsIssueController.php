@@ -5,49 +5,53 @@ namespace App\Http\Controllers;
 use App\Http\Requests\StoreGoodsIssueRequest;
 use App\Http\Requests\UpdateGoodsIssueRequest;
 use App\Models\GoodsIssue;
-use App\Models\GoodsIssueItem;
-use App\Models\Inventory;
-use App\Models\InventoryLog;
 use App\Models\Location;
-use App\Models\Material;
 use App\Models\SalesOrder;
 use App\Models\SalesOrderItem;
-use Illuminate\Routing\Controllers\HasMiddleware;
-use Illuminate\Routing\Controllers\Middleware;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\DB;
+use App\Services\GoodsIssueService;
+use App\Services\InventoryService;
+use App\Services\SalesOrderService;
+use Illuminate\Http\RedirectResponse;
 use Inertia\Inertia;
+use Inertia\Response;
 
-class GoodsIssueController extends Controller implements HasMiddleware
+/**
+ * HTTP entry points for goods issues.
+ *
+ * Stock only moves in GoodsIssueService::complete()/cancel(); this class
+ * authorizes, shapes the payload for the screens and redirects.
+ */
+class GoodsIssueController extends Controller
 {
-    public static function middleware(): array
-    {
-        return [
-            new Middleware('permission:goods-issue-view',     only: ['index', 'show']),
-            new Middleware('permission:goods-issue-create',   only: ['create', 'store']),
-            new Middleware('permission:goods-issue-edit',     only: ['edit', 'update']),
-            new Middleware('permission:goods-issue-delete',   only: ['destroy']),
-            new Middleware('permission:goods-issue-complete', only: ['complete']),
-            new Middleware('permission:goods-issue-cancel',   only: ['cancel']),
-            new Middleware('permission:goods-issue-revert',   only: ['revert']),
-        ];
-    }
+    public function __construct(
+        private readonly GoodsIssueService $issues,
+        private readonly SalesOrderService $orders,
+        private readonly InventoryService $inventory,
+    ) {}
 
-    public function index()
+    public function index(): Response
     {
-        $gis = GoodsIssue::with(['salesOrder.customer', 'location', 'user'])
-            ->latest()
-            ->get();
+        $this->authorize('viewAny', GoodsIssue::class);
 
         return Inertia::render('sales/goods-issue/index', [
-            'goodsIssues' => $gis,
+            'goodsIssues' => GoodsIssue::query()
+                ->with(['salesOrder.customer', 'location:id,code,name', 'user:id,name'])
+                ->latest()
+                ->get(),
         ]);
     }
 
-    public function create(SalesOrder $salesOrder)
+    /**
+     * Shipping form for one sales order, with the outstanding quantity per
+     * line and the available stock per location resolved up front.
+     */
+    public function create(SalesOrder $salesOrder): Response|RedirectResponse
     {
-        if (!$salesOrder->canCreateGi()) {
-            return redirect()->route('sales-orders.show', $salesOrder->id)
+        $this->authorize('create', GoodsIssue::class);
+
+        if (! $salesOrder->canCreateGi()) {
+            return redirect()
+                ->route('sales-orders.show', $salesOrder->id)
                 ->with('error', 'Goods issue cannot be created for this sales order.');
         }
 
@@ -58,119 +62,61 @@ class GoodsIssueController extends Controller implements HasMiddleware
             'items.material.uom',
         ]);
 
-        $locations = Location::all(['id', 'code', 'name']);
-
-        // Build inventory map: material_id -> location_id -> quantity
-        $materialIds = $salesOrder->items->pluck('material_id')->unique();
-        $inventoryMap = \App\Models\Inventory::whereIn('material_id', $materialIds)
-            ->get()
-            ->groupBy('material_id')
-            ->map(function ($rows) {
-                return $rows->keyBy('location_id')->map(function ($inv) {
-                    $reserved = \App\Models\GoodsIssueItem::query()
-                        ->where('material_id', $inv->material_id)
-                        ->whereHas('goodsIssue', fn($q) => $q
-                            ->where('status', 'pending')
-                            ->where('location_id', $inv->location_id)
-                        )
-                        ->sum('qty_to_ship');
-
-                    return max(0, (float) $inv->quantity - (float) $reserved);
-                });
-            });
+        $outstanding = $this->orders->outstandingQuantities($salesOrder);
 
         return Inertia::render('sales/goods-issue/create', [
-            'salesOrder'   => array_merge($salesOrder->toArray(), [
-                'items' => $salesOrder->items->map(function ($item) {
-                    $otherPendingQty = \App\Models\GoodsIssueItem::query()
-                        ->where('sales_order_item_id', $item->id)
-                        ->whereHas('goodsIssue', fn($q) => $q->where('status', 'pending'))
-                        ->sum('qty_to_ship');
-
-                    return array_merge($item->toArray(), [
-                        'qty_remaining' => max(0, (float) $item->qty_ordered
-                            - (float) $item->qty_shipped
-                            - (float) $otherPendingQty),
-                    ]);
-                }),
-            ]),
-            'locations'    => $locations,
-            'inventoryMap' => $inventoryMap,
+            'salesOrder' => [
+                ...$salesOrder->toArray(),
+                'items' => $salesOrder->items
+                    ->map(fn (SalesOrderItem $item): array => [
+                        ...$item->toArray(),
+                        'qty_remaining' => $outstanding[$item->id] ?? 0,
+                    ])
+                    ->all(),
+            ],
+            'locations' => Location::query()->orderBy('name')->get(['id', 'code', 'name']),
+            'inventoryMap' => $this->availableStockMap($salesOrder),
         ]);
     }
 
-    public function store(StoreGoodsIssueRequest $request)
+    public function store(StoreGoodsIssueRequest $request): RedirectResponse
     {
-        DB::transaction(function () use ($request) {
-            $so = SalesOrder::findOrFail($request->sales_order_id);
+        $data = $request->toData();
+        $order = SalesOrder::findOrFail($data->salesOrderId);
 
-            $gi = GoodsIssue::create([
-                'sales_order_id'   => $so->id,
-                'user_id'          => Auth::id(),
-                'location_id'      => $request->location_id,
-                'status'           => 'pending',
-                'gi_date'          => $request->gi_date,
-                'transaction_date' => $request->transaction_date,
-                'remarks'          => $request->remarks,
-            ]);
+        $issue = $this->issues->create($order, $data);
 
-            foreach ($request->items as $item) {
-                $soItem     = SalesOrderItem::findOrFail($item['sales_order_item_id']);
-                $qtyIssued  = (float) $soItem->qty_shipped;
-                $qtyOrdered = (float) $soItem->qty_ordered;
-
-                $gi->items()->create([
-                    'sales_order_item_id' => $soItem->id,
-                    'material_id'         => $soItem->material_id,
-                    'qty_ordered'         => $qtyOrdered,
-                    'qty_shipped'          => $qtyIssued,
-                    'qty_to_ship'        => (float) $item['qty_to_ship'],
-                    'qty_remaining'       => $qtyOrdered - $qtyIssued - (float) $item['qty_to_ship'],
-                    'unit_price'          => $soItem->unit_price_after_discount,
-                    'serial_number'       => $item['serial_number'] ?? null,
-                    'batch_number'        => $item['batch_number'] ?? null,
-                    'remarks'             => $item['remarks'] ?? null,
-                ]);
-            }
-
-            $gi->logs()->create([
-                'user_id'   => Auth::id(),
-                'action'    => 'created',
-                'to_status' => 'pending',
-                'remarks'   => 'Goods issue created',
-            ]);
-
-            $so->logs()->create([
-                'user_id' => Auth::id(),
-                'action'  => 'gi_created',
-                'remarks' => "GI {$gi->code} created",
-            ]);
-        });
-
-        return redirect()->route('goods-issues.index')
-            ->with('success', 'Goods issue created successfully.');
+        return redirect()
+            ->route('goods-issues.show', $issue->id)
+            ->with('success', "Goods issue {$issue->code} created successfully.");
     }
 
-    public function show(GoodsIssue $goodsIssue)
+    public function show(GoodsIssue $goodsIssue): Response
     {
+        $this->authorize('view', $goodsIssue);
+
         $goodsIssue->load([
             'salesOrder.customer',
             'location',
-            'user',
-            'items.material',
+            'user:id,name',
+            'items.material.uom',
             'items.salesOrderItem',
-            'logs.user',
+            'logs.user:id,name',
         ]);
 
         return Inertia::render('sales/goods-issue/show', [
             'goodsIssue' => $goodsIssue,
+            'can' => $goodsIssue->actionFlags(),
         ]);
     }
 
-    public function edit(GoodsIssue $goodsIssue)
+    public function edit(GoodsIssue $goodsIssue): Response|RedirectResponse
     {
-        if ($goodsIssue->status !== 'pending') {
-            return redirect()->route('goods-issues.show', $goodsIssue->id)
+        $this->authorize('update', $goodsIssue);
+
+        if (! $goodsIssue->canBeEdited()) {
+            return redirect()
+                ->route('goods-issues.show', $goodsIssue->id)
                 ->with('error', 'Only pending goods issues can be edited.');
         }
 
@@ -184,295 +130,83 @@ class GoodsIssueController extends Controller implements HasMiddleware
 
         return Inertia::render('sales/goods-issue/edit', [
             'goodsIssue' => $goodsIssue,
-            'locations'  => Location::all(['id', 'code', 'name']),
+            'locations' => Location::query()->orderBy('name')->get(['id', 'code', 'name']),
+            'outstanding' => $this->orders->outstandingQuantities(
+                $goodsIssue->salesOrder,
+                ignoreIssueId: $goodsIssue->id,
+            ),
+            'inventoryMap' => $this->availableStockMap($goodsIssue->salesOrder, $goodsIssue->id),
         ]);
     }
 
-    public function update(UpdateGoodsIssueRequest $request, GoodsIssue $goodsIssue)
+    public function update(UpdateGoodsIssueRequest $request, GoodsIssue $goodsIssue): RedirectResponse
     {
-        if ($goodsIssue->status !== 'pending') {
-            return redirect()->route('goods-issues.show', $goodsIssue->id)
-                ->with('error', 'Only pending goods issues can be edited.');
-        }
+        $this->issues->update($goodsIssue, $request->toData());
 
-        DB::transaction(function () use ($request, $goodsIssue) {
-            $goodsIssue->update([
-                'location_id'      => $request->location_id,
-                'gi_date'          => $request->gi_date,
-                'transaction_date' => $request->transaction_date,
-                'remarks'          => $request->remarks,
-            ]);
-
-            foreach ($request->items as $item) {
-                $goodsIssue->items()
-                    ->where('sales_order_item_id', $item['sales_order_item_id'])
-                    ->update([
-                        'qty_to_ship'  => $item['qty_to_ship'],
-                        'serial_number' => $item['serial_number'] ?? null,
-                        'batch_number'  => $item['batch_number'] ?? null,
-                        'remarks'       => $item['remarks'] ?? null,
-                    ]);
-            }
-
-            $goodsIssue->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'updated',
-                'from_status' => $goodsIssue->status,
-                'to_status'   => $goodsIssue->status,
-                'remarks'     => 'Goods issue updated',
-            ]);
-        });
-
-        return redirect()->route('goods-issues.show', $goodsIssue->id)
-            ->with('success', 'Goods issue updated successfully.');
+        return redirect()
+            ->route('goods-issues.show', $goodsIssue->id)
+            ->with('success', "Goods issue {$goodsIssue->code} updated successfully.");
     }
 
-    public function destroy(GoodsIssue $goodsIssue)
+    public function destroy(GoodsIssue $goodsIssue): RedirectResponse
     {
-        if ($goodsIssue->status !== 'pending') {
-            return redirect()->route('goods-issues.show', $goodsIssue->id)
-                ->with('error', 'Only pending goods issues can be deleted.');
-        }
+        $this->authorize('delete', $goodsIssue);
 
-        DB::transaction(function () use ($goodsIssue) {
-            $so = $goodsIssue->salesOrder;
-            $goodsIssue->delete();
-            $this->recalculateSoStatus($so);
-        });
+        $code = $goodsIssue->code;
 
-        return redirect()->route('goods-issues.index')
-            ->with('success', 'Goods issue deleted successfully.');
+        $this->issues->delete($goodsIssue);
+
+        return redirect()
+            ->route('goods-issues.index')
+            ->with('success', "Goods issue {$code} deleted successfully.");
     }
 
-    // ── Status Actions ────────────────────────────────────────────────────────
+    // ── Status actions ───────────────────────────────────────────────────────
 
-    public function complete(GoodsIssue $goodsIssue)
+    public function complete(GoodsIssue $goodsIssue): RedirectResponse
     {
-        if (!$goodsIssue->canBeCompleted()) {
-            return back()->with('error', 'Only pending goods issues can be completed.');
-        }
+        $this->authorize('complete', $goodsIssue);
 
-        // Validate inventory availability before doing anything
-        foreach ($goodsIssue->items as $giItem) {
-            $qtyToIssue = (float) $giItem->qty_to_ship;
-            if ($qtyToIssue <= 0) continue;
+        $this->issues->complete($goodsIssue);
 
-            $inventory = Inventory::where('material_id', $giItem->material_id)
-                ->where('location_id', $goodsIssue->location_id)
-                ->first();
-
-            $availableQty = $inventory ? (float) $inventory->quantity : 0;
-
-            if ($availableQty < $qtyToIssue) {
-                return back()->with('error', "Insufficient stock for [{$giItem->material->code}] {$giItem->material->name} "
-                        . "at {$goodsIssue->location->name}. "
-                        . "Available: {$availableQty}, Required: {$qtyToIssue}.",
-                );
-            }
-        }
-
-        DB::transaction(function () use ($goodsIssue) {
-            $so                  = $goodsIssue->salesOrder;
-            $affectedMaterialIds = [];
-
-            foreach ($goodsIssue->items as $giItem) {
-                $qtyToIssue = (float) $giItem->qty_to_ship;
-                if ($qtyToIssue <= 0) continue;
-
-                // Update SO item qty_shipped
-                $soItem        = $giItem->salesOrderItem;
-                $newQtyIssued  = (float) $soItem->qty_shipped + $qtyToIssue;
-                $soItem->update(['qty_shipped' => $newQtyIssued]);
-
-                // Deduct inventory
-                $inventory = Inventory::where('material_id', $giItem->material_id)
-                    ->where('location_id', $goodsIssue->location_id)
-                    ->first();
-
-                if ($inventory) {
-                    $qtyBefore = (float) $inventory->quantity;
-                    $newQty    = max(0, $qtyBefore - $qtyToIssue);
-                    $inventory->update(['quantity' => $newQty]);
-                } else {
-                    $qtyBefore = 0;
-                    $newQty    = 0;
-                    $inventory = Inventory::create([
-                        'code'        => Inventory::generateCode(),
-                        'material_id' => $giItem->material_id,
-                        'location_id' => $goodsIssue->location_id,
-                        'quantity'    => 0,
-                    ]);
-                }
-
-                InventoryLog::create([
-                    'movement_code'   => InventoryLog::generateMovementCode(),
-                    'inventory_id'    => $inventory->id,
-                    'material_id'     => $giItem->material_id,
-                    'location_id'     => $goodsIssue->location_id,
-                    'user_id'         => Auth::id(),
-                    'type'            => 'sales_issue',
-                    'quantity_before' => $qtyBefore,
-                    'quantity_change' => -$qtyToIssue,
-                    'quantity_after'  => $newQty,
-                    'reference_id'    => $goodsIssue->id,
-                    'reference_type'  => GoodsIssue::class,
-                    'remarks'         => "GI {$goodsIssue->code} completed",
-                ]);
-
-                $affectedMaterialIds[] = $giItem->material_id;
-            }
-
-            $goodsIssue->update(['status' => 'completed']);
-            $goodsIssue->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'completed',
-                'from_status' => 'pending',
-                'to_status'   => 'completed',
-                'remarks'     => 'Goods issue completed and inventory deducted',
-            ]);
-
-            // Recalculate avg_unit_price
-            foreach (array_unique($affectedMaterialIds) as $materialId) {
-                $material = Material::find($materialId);
-                $material?->recalculateAvgUnitPrice();
-            }
-
-            $this->recalculateSoStatus($so);
-        });
-
-        return redirect()->route('goods-issues.show', $goodsIssue->id)
-            ->with('success', 'Goods issue completed and inventory deducted.');
+        return redirect()
+            ->route('goods-issues.show', $goodsIssue->id)
+            ->with('success', "Goods issue {$goodsIssue->code} completed and inventory deducted.");
     }
 
-    public function cancel(GoodsIssue $goodsIssue)
+    public function cancel(GoodsIssue $goodsIssue): RedirectResponse
     {
-        if (!$goodsIssue->canBeCancelled()) {
-            return back()->with('error', 'This goods issue cannot be cancelled.');
-        }
+        $this->authorize('cancel', $goodsIssue);
 
-        DB::transaction(function () use ($goodsIssue) {
-            $fromStatus          = $goodsIssue->status;
-            $so                  = $goodsIssue->salesOrder;
-            $affectedMaterialIds = $goodsIssue->items
-                ->where('qty_to_ship', '>', 0)
-                ->pluck('material_id')
-                ->unique()
-                ->toArray();
+        $this->issues->cancel($goodsIssue);
 
-            if ($fromStatus === 'completed') {
-                foreach ($goodsIssue->items as $giItem) {
-                    $qtyToRestore = (float) $giItem->qty_to_ship;
-                    if ($qtyToRestore <= 0) continue;
-
-                    $inventory = Inventory::where('material_id', $giItem->material_id)
-                        ->where('location_id', $goodsIssue->location_id)
-                        ->first();
-
-                    if ($inventory) {
-                        $qtyBefore = (float) $inventory->quantity;
-                        $newQty    = $qtyBefore + $qtyToRestore;
-                        $inventory->update(['quantity' => $newQty]);
-
-                        InventoryLog::create([
-                            'movement_code'   => InventoryLog::generateMovementCode(),
-                            'inventory_id'    => $inventory->id,
-                            'material_id'     => $giItem->material_id,
-                            'location_id'     => $goodsIssue->location_id,
-                            'user_id'         => Auth::id(),
-                            'type'            => 'sales_return',
-                            'quantity_before' => $qtyBefore,
-                            'quantity_change' => $qtyToRestore,
-                            'quantity_after'  => $newQty,
-                            'reference_id'    => $goodsIssue->id,
-                            'reference_type'  => GoodsIssue::class,
-                            'remarks'         => "GI {$goodsIssue->code} cancelled - inventory restored",
-                        ]);
-                    }
-                }
-            }
-
-            $goodsIssue->update(['status' => 'cancelled']);
-            $goodsIssue->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'cancelled',
-                'from_status' => $fromStatus,
-                'to_status'   => 'cancelled',
-                'remarks'     => $fromStatus === 'completed'
-                    ? 'Goods issue cancelled and inventory restored'
-                    : 'Goods issue cancelled',
-            ]);
-
-            if ($fromStatus === 'completed') {
-                foreach ($affectedMaterialIds as $materialId) {
-                    $material = Material::find($materialId);
-                    $material?->recalculateAvgUnitPrice();
-                }
-            }
-
-            $this->recalculateSoStatus($so);
-        });
-
-        return redirect()->route('goods-issues.show', $goodsIssue->id)
-            ->with('success', 'Goods issue cancelled.');
+        return redirect()
+            ->route('goods-issues.show', $goodsIssue->id)
+            ->with('success', "Goods issue {$goodsIssue->code} cancelled.");
     }
 
-    public function revert(GoodsIssue $goodsIssue)
+    public function revert(GoodsIssue $goodsIssue): RedirectResponse
     {
-        if (!$goodsIssue->canBeReverted()) {
-            return back()->with('error', 'Only cancelled goods issues can be reverted to pending.');
-        }
+        $this->authorize('revert', $goodsIssue);
 
-        DB::transaction(function () use ($goodsIssue) {
-            $goodsIssue->update(['status' => 'pending']);
-            $goodsIssue->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'reverted',
-                'from_status' => 'cancelled',
-                'to_status'   => 'pending',
-                'remarks'     => 'Goods issue reverted to pending',
-            ]);
-        });
+        $this->issues->revert($goodsIssue);
 
-        return redirect()->route('goods-issues.show', $goodsIssue->id)
-            ->with('success', 'Goods issue reverted to pending.');
+        return redirect()
+            ->route('goods-issues.show', $goodsIssue->id)
+            ->with('success', "Goods issue {$goodsIssue->code} reverted to pending.");
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private function recalculateSoStatus(SalesOrder $so): void
+    /**
+     * Available stock for the order materials: material id => location id =>
+     * quantity that may still be promised.
+     *
+     * @return array<int, array<int, float>>
+     */
+    private function availableStockMap(SalesOrder $order, ?int $ignoreIssueId = null): array
     {
-        $so->refresh();
-
-        foreach ($so->items as $soItem) {
-            $totalIssued = GoodsIssueItem::whereHas('goodsIssue', function ($q) use ($so) {
-                    $q->where('sales_order_id', $so->id)
-                    ->where('status', 'completed');
-                })
-                ->where('sales_order_item_id', $soItem->id)
-                ->sum('qty_to_ship');
-
-            $soItem->update(['qty_shipped' => $totalIssued]);
-        }
-
-        $so->refresh();
-
-        $allFull   = $so->items->every(fn($i) => (float)$i->qty_shipped >= (float)$i->qty_ordered);
-        $anyIssued = $so->items->some(fn($i)  => (float)$i->qty_shipped > 0);
-
-        if ($so->status === 'cancelled') return;
-
-        if ($allFull) {
-            $so->update(['status' => 'fully_shipped']);
-        } elseif ($anyIssued) {
-            $so->update(['status' => 'partially_shipped']);
-        } else {
-            $so->update(['status' => 'posted']);
-        }
-
-        $so->logs()->create([
-            'user_id' => Auth::id(),
-            'action'  => 'status_recalculated',
-            'remarks' => "SO status recalculated to {$so->fresh()->status}",
-        ]);
+        return $this->inventory->availableQuantityMap(
+            $order->items->pluck('material_id'),
+            $ignoreIssueId,
+        );
     }
 }

@@ -2,83 +2,96 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\GoodsIssueStatus;
+use App\Enums\PurchaseOrderStatus;
+use App\Enums\SalesOrderStatus;
 use App\Models\Customer;
 use App\Models\PurchaseOrder;
 use App\Models\SalesOrder;
 use App\Models\Vendor;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Inertia\Inertia;
+use Inertia\Response;
 
 class DashboardController extends Controller
 {
-    /** Statuses that represent a live (non-draft, non-cancelled) order. */
-    private const OPEN_PO_STATUSES = ['posted', 'partially_received'];
-    private const OPEN_SO_STATUSES = ['posted', 'partially_shipped'];
-    private const LIVE_PO_STATUSES = ['posted', 'partially_received', 'fully_received'];
-    private const LIVE_SO_STATUSES = ['posted', 'partially_shipped', 'fully_shipped'];
+    /**
+     * Which statuses count as open (still outstanding) and which as live
+     * (anything past draft) is declared once on the status enums, so the
+     * dashboard can never drift from the order screens.
+     */
+    private const OPEN_PO_STATUSES = PurchaseOrderStatus::OPEN;
 
-    public function index()
+    private const OPEN_SO_STATUSES = SalesOrderStatus::OPEN;
+
+    private const LIVE_PO_STATUSES = PurchaseOrderStatus::LIVE;
+
+    private const LIVE_SO_STATUSES = SalesOrderStatus::LIVE;
+
+    public function index(): Response
     {
         $stockRows = $this->stockRows();
         $soldByMaterial = $this->soldValueByMaterial();
 
-        $stockValue = $stockRows->sum(fn($r) => $r->stock * $r->avg_unit_cost);
+        $stockValue = $stockRows->sum(fn ($r) => $r->stock * $r->avg_unit_cost);
         $lowStock = $stockRows
-            ->filter(fn($r) => $r->reorder_level > 0 && $r->stock <= $r->reorder_level)
-            ->sortBy(fn($r) => $r->reorder_level > 0 ? $r->stock / $r->reorder_level : 0)
+            ->filter(fn ($r) => $r->reorder_level > 0 && $r->stock <= $r->reorder_level)
+            ->sortBy(fn ($r) => $r->reorder_level > 0 ? $r->stock / $r->reorder_level : 0)
             ->values();
 
         return Inertia::render('dashboard', [
             'stats' => [
-                'materials'      => $stockRows->count(),
-                'stock_qty'      => round($stockRows->sum('stock'), 2),
-                'stock_value'    => round($stockValue, 2),
-                'low_stock'      => $lowStock->count(),
-                'out_of_stock'   => $stockRows->where('stock', '<=', 0)->count(),
+                'materials' => $stockRows->count(),
+                'stock_qty' => round($stockRows->sum('stock'), 2),
+                'stock_value' => round($stockValue, 2),
+                'low_stock' => $lowStock->count(),
+                'out_of_stock' => $stockRows->where('stock', '<=', 0)->count(),
                 'purchase_value' => round((float) PurchaseOrder::whereIn('status', self::LIVE_PO_STATUSES)->sum('grand_total'), 2),
-                'sales_value'    => round((float) SalesOrder::whereIn('status', self::LIVE_SO_STATUSES)->sum('grand_total'), 2),
-                'open_po'        => PurchaseOrder::whereIn('status', self::OPEN_PO_STATUSES)->count(),
-                'open_so'        => SalesOrder::whereIn('status', self::OPEN_SO_STATUSES)->count(),
-                'vendors'        => Vendor::count(),
-                'customers'      => Customer::count(),
+                'sales_value' => round((float) SalesOrder::whereIn('status', self::LIVE_SO_STATUSES)->sum('grand_total'), 2),
+                'open_po' => PurchaseOrder::whereIn('status', self::OPEN_PO_STATUSES)->count(),
+                'open_so' => SalesOrder::whereIn('status', self::OPEN_SO_STATUSES)->count(),
+                'vendors' => Vendor::count(),
+                'customers' => Customer::count(),
             ],
-            'monthlyTrend'   => $this->monthlyTrend(),
+            'monthlyTrend' => $this->monthlyTrend(),
             'stockByCategory' => $this->stockByCategory($stockRows),
-            'topStockValue'  => $stockRows
-                ->map(fn($r) => [
-                    'code'  => $r->code,
-                    'name'  => $r->name,
+            'topStockValue' => $stockRows
+                ->map(fn ($r) => [
+                    'code' => $r->code,
+                    'name' => $r->name,
                     'value' => round($r->stock * $r->avg_unit_cost, 2),
                 ])
                 ->where('value', '>', 0)
                 ->sortByDesc('value')
                 ->take(8)
                 ->values(),
-            'topSoldValue'   => $stockRows
-                ->map(fn($r) => [
-                    'code'  => $r->code,
-                    'name'  => $r->name,
+            'topSoldValue' => $stockRows
+                ->map(fn ($r) => [
+                    'code' => $r->code,
+                    'name' => $r->name,
                     'value' => round((float) ($soldByMaterial[$r->id] ?? 0), 2),
                 ])
                 ->where('value', '>', 0)
                 ->sortByDesc('value')
                 ->take(8)
                 ->values(),
-            'lowStockItems'  => $lowStock
+            'lowStockItems' => $lowStock
                 ->take(10)
-                ->map(fn($r) => [
-                    'id'            => $r->id,
-                    'code'          => $r->code,
-                    'name'          => $r->name,
-                    'uom'           => $r->uom,
-                    'stock'         => round($r->stock, 2),
+                ->map(fn ($r) => [
+                    'id' => $r->id,
+                    'code' => $r->code,
+                    'name' => $r->name,
+                    'uom' => $r->uom,
+                    'stock' => round($r->stock, 2),
                     'reorder_level' => (float) $r->reorder_level,
                 ])
                 ->values(),
-            'orderStatus'    => [
+            'orderStatus' => [
                 'purchase' => $this->statusCounts(PurchaseOrder::query()),
-                'sales'    => $this->statusCounts(SalesOrder::query()),
+                'sales' => $this->statusCounts(SalesOrder::query()),
             ],
         ]);
     }
@@ -87,7 +100,7 @@ class DashboardController extends Controller
     private function stockRows()
     {
         return DB::table('materials')
-            ->leftJoin('inventories', fn($j) => $j
+            ->leftJoin('inventories', fn ($j) => $j
                 ->on('inventories.material_id', '=', 'materials.id')
                 ->whereNull('inventories.deleted_at'))
             ->leftJoin('categories', 'categories.id', '=', 'materials.category_id')
@@ -117,13 +130,13 @@ class DashboardController extends Controller
     {
         return DB::table('goods_issue_items')
             ->join('goods_issues', 'goods_issues.id', '=', 'goods_issue_items.goods_issue_id')
-            ->where('goods_issues.status', 'completed')
+            ->where('goods_issues.status', GoodsIssueStatus::Completed->value)
             ->whereNull('goods_issues.deleted_at')
             ->groupBy('goods_issue_items.material_id')
             ->select('goods_issue_items.material_id')
             ->selectRaw('SUM(goods_issue_items.qty_to_ship * goods_issue_items.unit_price) as sold_value')
             ->get()
-            ->mapWithKeys(fn($row) => [$row->material_id => (float) $row->sold_value])
+            ->mapWithKeys(fn ($row) => [$row->material_id => (float) $row->sold_value])
             ->all();
     }
 
@@ -140,9 +153,9 @@ class DashboardController extends Controller
             $month = $start->copy()->addMonths($i);
             $key = $month->format('Y-m');
             $months[] = [
-                'month'     => $month->format('M Y'),
+                'month' => $month->format('M Y'),
                 'purchases' => round((float) ($purchases[$key] ?? 0), 2),
-                'sales'     => round((float) ($sales[$key] ?? 0), 2),
+                'sales' => round((float) ($sales[$key] ?? 0), 2),
             ];
         }
 
@@ -158,8 +171,8 @@ class DashboardController extends Controller
             ->where('order_date', '>=', $start->toDateString())
             ->select('order_date', 'grand_total')
             ->get()
-            ->groupBy(fn($row) => substr((string) $row->order_date, 0, 7))
-            ->map(fn($rows) => (float) $rows->sum('grand_total'))
+            ->groupBy(fn ($row) => substr((string) $row->order_date, 0, 7))
+            ->map(fn ($rows) => (float) $rows->sum('grand_total'))
             ->all();
     }
 
@@ -167,12 +180,12 @@ class DashboardController extends Controller
     private function stockByCategory($stockRows): array
     {
         $grouped = $stockRows
-            ->groupBy(fn($r) => $r->category ?? 'Uncategorized')
-            ->map(fn($rows, $category) => [
+            ->groupBy(fn ($r) => $r->category ?? 'Uncategorized')
+            ->map(fn ($rows, $category) => [
                 'category' => $category,
-                'value'    => round($rows->sum(fn($r) => $r->stock * $r->avg_unit_cost), 2),
+                'value' => round($rows->sum(fn ($r) => $r->stock * $r->avg_unit_cost), 2),
             ])
-            ->filter(fn($row) => $row['value'] > 0)
+            ->filter(fn ($row) => $row['value'] > 0)
             ->sortByDesc('value')
             ->values();
 
@@ -185,22 +198,43 @@ class DashboardController extends Controller
 
         return $top->push([
             'category' => 'Others',
-            'value'    => round($others->sum('value'), 2),
+            'value' => round($others->sum('value'), 2),
         ])->all();
     }
 
+    /**
+     * Count of documents per status, drafts excluded, labelled through the
+     * status enum so the wording matches the document screens.
+     *
+     * @param  Builder<Model>  $query
+     * @return array<int, array{status: string, total: int}>
+     */
     private function statusCounts($query): array
     {
+        $model = $query->getModel();
+
         return $query
             ->where('status', '!=', 'draft')
             ->groupBy('status')
             ->selectRaw('status, COUNT(*) as total')
             ->pluck('total', 'status')
-            ->map(fn($total, $status) => [
-                'status' => str_replace('_', ' ', $status),
-                'total'  => (int) $total,
+            ->map(fn ($total, $status) => [
+                'status' => $this->statusLabel($model, (string) $status),
+                'total' => (int) $total,
             ])
             ->values()
             ->all();
+    }
+
+    /**
+     * Resolve a raw status value to its label via the model's status enum.
+     */
+    private function statusLabel(object $model, string $status): string
+    {
+        $enum = $model instanceof PurchaseOrder
+            ? PurchaseOrderStatus::tryFrom($status)
+            : SalesOrderStatus::tryFrom($status);
+
+        return $enum?->label() ?? str_replace('_', ' ', $status);
     }
 }

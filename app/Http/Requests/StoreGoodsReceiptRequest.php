@@ -2,56 +2,142 @@
 
 namespace App\Http\Requests;
 
-use App\Models\PurchaseOrderItem;
+use App\Data\GoodsReceiptData;
+use App\Http\Requests\Concerns\ValidatesStockDocumentPayload;
+use App\Models\GoodsReceipt;
+use App\Models\PurchaseOrder;
+use App\Services\PurchaseOrderService;
 use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Validator;
 
+/**
+ * Validates a new goods receipt.
+ *
+ * On top of the shared rules it checks that every line belongs to the given
+ * purchase order and that the quantity fits in what is still outstanding
+ * (quantities held by other pending receipts included).
+ */
 class StoreGoodsReceiptRequest extends FormRequest
 {
-    public function authorize(): bool { return true; }
+    use ValidatesStockDocumentPayload;
 
+    public function authorize(): bool
+    {
+        return $this->user()?->can('create', GoodsReceipt::class) ?? false;
+    }
+
+    protected function prepareForValidation(): void
+    {
+        $this->normaliseStockPayload();
+    }
+
+    /**
+     * @return array<string, array<int, mixed>>
+     */
     public function rules(): array
     {
         return [
-            'purchase_order_id'              => ['required', 'exists:purchase_orders,id'],
-            'location_id'                    => ['required', 'exists:locations,id'],
-            'gr_date'                        => ['required', 'date'],
-            'transaction_date'               => ['required', 'date'],
-            'remarks'                        => ['nullable', 'string'],
-            'items'                          => ['required', 'array', 'min:1'],
-            'items.*.purchase_order_item_id' => ['required', 'exists:purchase_order_items,id'],
-            'items.*.qty_to_receive'         => ['required', 'numeric', 'min:0.000001', $this->qtyRule()],
-            'items.*.serial_number'          => ['nullable', 'string'],
-            'items.*.batch_number'           => ['nullable', 'string'],
-            'items.*.remarks'                => ['nullable', 'string'],
+            'purchase_order_id' => ['required', 'integer', 'exists:purchase_orders,id'],
+            ...$this->stockDocumentRules('purchase_order_items'),
         ];
     }
 
-    private function qtyRule(): \Closure
+    /**
+     * @return array<string, string>
+     */
+    public function messages(): array
     {
-        return function ($attribute, $value, $fail) {
-            preg_match('/items\.(\d+)\./', $attribute, $matches);
-            $index = $matches[1] ?? null;
-            if ($index === null) return;
+        return $this->stockDocumentMessages();
+    }
 
-            $poItemId = $this->input("items.{$index}.purchase_order_item_id");
-            if (!$poItemId) return;
+    /**
+     * @return array<string, string>
+     */
+    public function attributes(): array
+    {
+        return $this->stockDocumentAttributes();
+    }
 
-            $poItem = PurchaseOrderItem::find($poItemId);
-            if (!$poItem) return;
+    /**
+     * @return array<int, callable>
+     */
+    public function after(): array
+    {
+        return [
+            fn (Validator $validator) => $this->validateAgainstOrder($validator),
+        ];
+    }
 
-            // Also account for other pending GRs not yet completed
-            $otherPendingQty = \App\Models\GoodsReceiptItem::query()
-                ->where('purchase_order_item_id', $poItemId)
-                ->whereHas('goodsReceipt', fn($q) => $q->where('status', 'pending'))
-                ->sum('qty_to_receive');
+    /**
+     * Each line must belong to the order and stay within its outstanding
+     * quantity.
+     */
+    protected function validateAgainstOrder(Validator $validator): void
+    {
+        $order = PurchaseOrder::with('items.material')->find($this->input('purchase_order_id'));
 
-            $qtyRemaining = (float) $poItem->qty_ordered
-                - (float) $poItem->qty_received
-                - (float) $otherPendingQty;
+        if ($order === null) {
+            return;
+        }
 
-            if ((float) $value > $qtyRemaining) {
-                $fail("Qty to receive cannot exceed remaining quantity of {$qtyRemaining}.");
+        if (! $order->status->allowsReceiving()) {
+            $validator->errors()->add('purchase_order_id', 'This purchase order is not open for receiving.');
+
+            return;
+        }
+
+        $outstanding = app(PurchaseOrderService::class)->outstandingQuantities($order, $this->ignoredReceiptId());
+        $orderItems = $order->items->keyBy('id');
+
+        foreach ((array) $this->input('items', []) as $index => $item) {
+            $itemId = (int) ($item[$this->orderItemKey()] ?? 0);
+            $quantity = (float) ($item[$this->quantityKey()] ?? 0);
+
+            $orderItem = $orderItems->get($itemId);
+
+            if ($orderItem === null) {
+                $validator->errors()->add(
+                    "items.{$index}.".$this->orderItemKey(),
+                    'This item does not belong to the selected purchase order.',
+                );
+
+                continue;
             }
-        };
+
+            $limit = (float) ($outstanding[$itemId] ?? 0);
+
+            if ($quantity > $limit) {
+                $validator->errors()->add(
+                    "items.{$index}.".$this->quantityKey(),
+                    "Quantity to receive cannot exceed the outstanding {$limit}.",
+                );
+            }
+        }
+    }
+
+    /** The receipt being edited, so its own quantities are not counted twice. */
+    protected function ignoredReceiptId(): ?int
+    {
+        return null;
+    }
+
+    public function toData(): GoodsReceiptData
+    {
+        return GoodsReceiptData::fromRequest($this);
+    }
+
+    protected function quantityKey(): string
+    {
+        return 'qty_to_receive';
+    }
+
+    protected function orderItemKey(): string
+    {
+        return 'purchase_order_item_id';
+    }
+
+    protected function documentDateKey(): string
+    {
+        return 'gr_date';
     }
 }

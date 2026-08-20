@@ -2,102 +2,53 @@
 
 namespace App\Http\Requests;
 
-use App\Models\SalesOrderItem;
-use Illuminate\Foundation\Http\FormRequest;
+use App\Models\GoodsIssue;
+use Illuminate\Validation\Validator;
 
-class UpdateGoodsIssueRequest extends FormRequest
+/**
+ * Validates an edit to a pending goods issue.
+ *
+ * Reuses the store rules, resolves the sales order from the issue itself and
+ * excludes this issue from both the outstanding quantity and the stock
+ * reservation, so editing a line does not fight with its own reservation.
+ */
+class UpdateGoodsIssueRequest extends StoreGoodsIssueRequest
 {
-    public function authorize(): bool { return true; }
+    public function authorize(): bool
+    {
+        $issue = $this->issue();
 
-    public function rules(): array
+        return $issue !== null && ($this->user()?->can('update', $issue) ?? false);
+    }
+
+    protected function prepareForValidation(): void
+    {
+        parent::prepareForValidation();
+
+        $this->merge([
+            'sales_order_id' => $this->issue()?->sales_order_id,
+        ]);
+    }
+
+    /**
+     * @return array<int, callable>
+     */
+    public function after(): array
     {
         return [
-            'location_id'                 => ['required', 'exists:locations,id'],
-            'gi_date'                     => ['required', 'date'],
-            'transaction_date'            => ['required', 'date'],
-            'remarks'                     => ['nullable', 'string'],
-            'items'                       => ['required', 'array', 'min:1'],
-            'items.*.sales_order_item_id' => ['required', 'exists:sales_order_items,id'],
-            'items.*.qty_to_ship' => ['required', 'numeric', 'min:0.000001', $this->qtyRule(), $this->inventoryRule()],
-            'items.*.serial_number'       => ['nullable', 'string'],
-            'items.*.batch_number'        => ['nullable', 'string'],
-            'items.*.remarks'             => ['nullable', 'string'],
+            fn (Validator $validator) => $this->validateAgainstOrder($validator),
         ];
     }
 
-    private function qtyRule(): \Closure
+    protected function ignoredIssueId(): ?int
     {
-        return function ($attribute, $value, $fail) {
-            preg_match('/items\.(\d+)\./', $attribute, $matches);
-            $index = $matches[1] ?? null;
-            if ($index === null) return;
-
-            $soItemId = $this->input("items.{$index}.sales_order_item_id");
-            if (!$soItemId) return;
-
-            $soItem = SalesOrderItem::find($soItemId);
-            if (!$soItem) return;
-
-            $giId = $this->route('goods_issue')?->id ?? $this->route('goods_issue');
-
-            $otherPendingQty = \App\Models\GoodsIssueItem::query()
-                ->where('sales_order_item_id', $soItemId)
-                ->whereHas('goodsIssue', fn($q) => $q
-                    ->where('status', 'pending')
-                    ->when($giId, fn($q) => $q->where('id', '!=', $giId))
-                )
-                ->sum('qty_to_ship');
-
-            $qtyRemaining = (float) $soItem->qty_ordered
-                - (float) $soItem->qty_shipped
-                - (float) $otherPendingQty;
-
-            if ((float) $value > $qtyRemaining) {
-                $fail("Qty to ship cannot exceed remaining quantity of {$qtyRemaining}.");
-            }
-        };
+        return $this->issue()?->id;
     }
 
-    private function inventoryRule(): \Closure
+    private function issue(): ?GoodsIssue
     {
-        return function ($attribute, $value, $fail) {
-            $locationId = $this->input('location_id');
-            if (!$locationId) return;
+        $issue = $this->route('goods_issue');
 
-            preg_match('/items\.(\d+)\./', $attribute, $matches);
-            $index = $matches[1] ?? null;
-            if ($index === null) return;
-
-            $soItemId = $this->input("items.{$index}.sales_order_item_id");
-            if (!$soItemId) return;
-
-            $soItem = \App\Models\SalesOrderItem::find($soItemId);
-            if (!$soItem) return;
-
-            $inventory = \App\Models\Inventory::where('material_id', $soItem->material_id)
-                ->where('location_id', $locationId)
-                ->first();
-
-            $physicalQty = $inventory ? (float) $inventory->quantity : 0;
-
-            // Subtract already-pending GI quantities for this material+location
-            $giId = $this->route('goods_issue')?->id; // null on store, current GI id on update
-
-            $reservedQty = \App\Models\GoodsIssueItem::query()
-                ->where('material_id', $soItem->material_id)
-                ->whereHas('goodsIssue', fn($q) => $q
-                    ->where('status', 'pending')
-                    ->where('location_id', $locationId)
-                    ->when($giId, fn($q) => $q->where('id', '!=', $giId))
-                )
-                ->sum('qty_to_ship');
-
-            $available = $physicalQty - (float) $reservedQty;
-
-            if ((float) $value > $available) {
-                $material = $soItem->material;
-                $fail("Insufficient stock for [{$material->code}] {$material->name}. Available: {$available}, Required: {$value}.");
-            }
-        };
+        return $issue instanceof GoodsIssue ? $issue : null;
     }
 }

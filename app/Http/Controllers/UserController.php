@@ -5,11 +5,12 @@ namespace App\Http\Controllers;
 use App\Http\Requests\StoreUserRequest;
 use App\Http\Requests\UpdateUserRequest;
 use App\Models\User;
-use Illuminate\Http\Request;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Routing\Controllers\HasMiddleware;
 use Illuminate\Routing\Controllers\Middleware;
 use Illuminate\Support\Facades\Hash;
 use Inertia\Inertia;
+use Inertia\Response;
 use Spatie\Permission\Models\Role;
 
 class UserController extends Controller implements HasMiddleware
@@ -29,19 +30,21 @@ class UserController extends Controller implements HasMiddleware
         ];
     }
 
-    public function index()
+    public function index(): Response
     {
         $users = User::with('roles')->latest()->get();
+
         return Inertia::render('user/index', ['users' => $users]);
     }
 
-    public function create()
+    public function create(): Response
     {
         $roles = Role::all();
+
         return Inertia::render('user/create', ['roles' => $roles]);
     }
 
-    public function store(StoreUserRequest $request)
+    public function store(StoreUserRequest $request): RedirectResponse
     {
         $user = User::create([
             'name' => $request->name,
@@ -59,21 +62,22 @@ class UserController extends Controller implements HasMiddleware
         return redirect()->route('users.index')->with('success', 'User created successfully');
     }
 
-    public function show(User $user)
+    public function show(User $user): Response
     {
         return Inertia::render('user/show', ['user' => $user->load('roles')]);
     }
 
-    public function edit(User $user)
+    public function edit(User $user): Response
     {
         $roles = Role::all();
+
         return Inertia::render('user/edit', [
             'user' => $user->load('roles'),
             'roles' => $roles,
         ]);
     }
 
-    public function update(UpdateUserRequest $request, User $user)
+    public function update(UpdateUserRequest $request, User $user): RedirectResponse
     {
         if ($this->isProtected($user)) {
             return redirect()->route('users.index')
@@ -87,12 +91,12 @@ class UserController extends Controller implements HasMiddleware
             'force_password_change' => $request->force_password_change ?? false,
             'is_active' => $request->is_active ?? true,
             'is_locked' => $request->is_locked ?? false,
-            'login_attempts' => !$request->is_locked ? 0 : $user->login_attempts,
+            'login_attempts' => ! $request->is_locked ? 0 : $user->login_attempts,
         ]);
 
         if ($request->password) {
             $user->update([
-                'password'            => Hash::make($request->password),
+                'password' => Hash::make($request->password),
                 'password_changed_at' => now(),
             ]);
         }
@@ -104,7 +108,7 @@ class UserController extends Controller implements HasMiddleware
         return redirect()->route('users.index')->with('success', 'User updated successfully');
     }
 
-    public function destroy(User $user)
+    public function destroy(User $user): RedirectResponse
     {
         if ($this->isProtected($user)) {
             return redirect()->route('users.index')
@@ -112,6 +116,7 @@ class UserController extends Controller implements HasMiddleware
         }
 
         $user->delete();
+
         return redirect()->route('users.index')->with('success', 'User deleted successfully');
     }
 }

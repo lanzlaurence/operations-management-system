@@ -2,768 +2,496 @@
 
 namespace Database\Seeders;
 
-use App\Models\Customer;
+use App\Data\GoodsIssueData;
+use App\Data\SalesOrderData;
 use App\Models\GoodsIssue;
-use App\Models\GoodsIssueItem;
-use App\Models\Inventory;
-use App\Models\InventoryLog;
-use App\Models\Location;
-use App\Models\Material;
 use App\Models\SalesOrder;
-use App\Models\SalesOrderItem;
-use App\Models\TransactionLog;
-use App\Models\User;
+use App\Services\GoodsIssueService;
+use App\Services\InventoryService;
+use App\Services\SalesOrderService;
+use App\Support\Money;
+use Database\Seeders\Concerns\SeedsThroughServices;
 use Illuminate\Database\Seeder;
 
+/**
+ * Sample sales data covering every state a sales order can reach.
+ *
+ * Built through SalesOrderService and GoodsIssueService, so the totals,
+ * shipped quantities, stock deductions, average selling prices and audit trail
+ * match what the application itself would produce. Quantities are checked
+ * against the stock available at the chosen location before a line is added,
+ * which keeps the seeder working whatever the opening balances happen to be.
+ *
+ * Scenarios seeded:
+ *
+ *   1  draft, single line
+ *   2  draft with line discounts, header discount and a discount charge
+ *   3  posted, nothing shipped yet
+ *   4  posted with a pending issue (stock reserved, not yet deducted)
+ *   5  partially shipped from one delivery
+ *   6  fully shipped in one delivery
+ *   7  fully shipped across two deliveries from two locations
+ *   8  partially shipped with a second delivery still pending
+ *   9  cancelled straight from posted
+ *  10  cancelled after a completed issue (stock returned)
+ *  11  reverted from posted back to draft
+ *  12  cancelled, then reverted back to draft with its issue reopened
+ *  13  mixed VAT inclusive and exclusive lines with percentage charges
+ *  14  three lines, two shipped in full and one partially
+ *  15  issue carrying serial and batch references
+ */
 class SalesOrderSeeder extends Seeder
 {
+    use SeedsThroughServices;
+
+    public function __construct(
+        private readonly SalesOrderService $orders,
+        private readonly GoodsIssueService $issues,
+        private readonly InventoryService $inventory,
+    ) {}
+
     public function run(): void
     {
-        $user      = User::first();
-        $customers = Customer::all();
-        $materials = Material::where('status', 'active')->get();
-        $locations = Location::all();
-
-        $whnMnl = $locations->where('code', 'WH-MNL')->first();
-        $whCeb  = $locations->where('code', 'WH-CEB')->first();
-        $whDav  = $locations->where('code', 'WH-DAV')->first();
-        $stBgc  = $locations->where('code', 'ST-BGC')->first();
-        $stMak  = $locations->where('code', 'ST-MAK')->first();
-        $dcNth  = $locations->where('code', 'DC-NTH')->first();
-
-        // ── Helpers ────────────────────────────────────────────────────────────
-
-        $buildSoTotals = function (array $items): array {
-            $totalBefore = 0;
-            $totalVat    = 0;
-
-            foreach ($items as &$item) {
-                $net = round($item['qty'] * $item['unit_price'], 2);
-                $vat = $item['is_vatable'] ? round($net * 0.12, 2) : 0;
-
-                $item['net_price']   = $net;
-                $item['vat_price']   = $vat;
-                $item['gross_price'] = $net + $vat;
-
-                $totalBefore += $net;
-                $totalVat    += $vat;
-            }
-            unset($item);
-
-            return [
-                'items'                 => $items,
-                'total_before_discount' => $totalBefore,
-                'total_item_discount'   => 0,
-                'total_net_price'       => $totalBefore,
-                'total_vat'             => $totalVat,
-                'total_gross'           => $totalBefore + $totalVat,
-                'total_charges'         => 0,
-                'header_discount_total' => 0,
-                'grand_total'           => $totalBefore + $totalVat,
-            ];
-        };
-
-        $createSo = function (
-            array $soData,
-            array $rawItems,
-            string $status
-        ) use ($user, $buildSoTotals): SalesOrder {
-
-            $computed = $buildSoTotals($rawItems);
-
-            $so = SalesOrder::create([
-                'customer_id'           => $soData['customer_id'],
-                'user_id'               => $user->id,
-                'status'                => $status,
-                'order_date'            => $soData['order_date'],
-                'delivery_date'         => $soData['delivery_date'] ?? null,
-                'reference_no'          => $soData['reference_no']  ?? null,
-                'discount_type'         => null,
-                'discount_amount'       => 0,
-                'total_before_discount' => $computed['total_before_discount'],
-                'total_item_discount'   => 0,
-                'total_net_price'       => $computed['total_net_price'],
-                'total_vat'             => $computed['total_vat'],
-                'total_gross'           => $computed['total_gross'],
-                'total_charges'         => 0,
-                'header_discount_total' => 0,
-                'grand_total'           => $computed['grand_total'],
-                'remarks'               => $soData['remarks'] ?? null,
-            ]);
-
-            foreach ($computed['items'] as $line => $item) {
-                SalesOrderItem::create([
-                    'sales_order_id'            => $so->id,
-                    'material_id'               => $item['material_id'],
-                    'line_number'               => $line + 1,
-                    'qty_ordered'               => $item['qty'],
-                    'qty_shipped'               => $item['qty_shipped'] ?? 0,
-                    'unit_price'                => $item['unit_price'],
-                    'discount_type'             => null,
-                    'discount_amount'           => 0,
-                    'unit_price_after_discount' => $item['unit_price'],
-                    'net_price'                 => $item['net_price'],
-                    'is_vatable'                => $item['is_vatable'],
-                    'vat_type'                  => $item['is_vatable'] ? 'inclusive' : null,
-                    'vat_rate'                  => $item['is_vatable'] ? 12 : 0,
-                    'vat_price'                 => $item['vat_price'],
-                    'gross_price'               => $item['gross_price'],
-                    'remarks'                   => $item['remarks'] ?? null,
-                ]);
-            }
-
-            return $so;
-        };
-
-        $createGi = function (
-            SalesOrder $so,
-            array $giLines,         // [sales_order_item_id => qty_to_ship]
-            Location $location,
-            string $giStatus,
-            string $giDate,
-            string $remarks = ''
-        ) use ($user): GoodsIssue {
-
-            $gi = GoodsIssue::create([
-                'sales_order_id'   => $so->id,
-                'user_id'          => $user->id,
-                'location_id'      => $location->id,
-                'status'           => $giStatus,
-                'gi_date'          => $giDate,
-                'transaction_date' => $giDate,
-                'remarks'          => $remarks,
-            ]);
-
-            TransactionLog::create([
-                'user_id'       => $user->id,
-                'action'        => 'created',
-                'from_status'   => null,
-                'to_status'     => 'pending',
-                'loggable_id'   => $gi->id,
-                'loggable_type' => GoodsIssue::class,
-            ]);
-
-            foreach ($giLines as $soItemId => $qtyToShip) {
-                $soItem = SalesOrderItem::find($soItemId);
-
-                GoodsIssueItem::create([
-                    'goods_issue_id'    => $gi->id,
-                    'sales_order_item_id' => $soItemId,
-                    'material_id'       => $soItem->material_id,
-                    'qty_ordered'       => $soItem->qty_ordered,
-                    'qty_shipped'       => $soItem->qty_shipped,
-                    'qty_to_ship'       => $qtyToShip,
-                    'qty_remaining'     => $soItem->qty_ordered - $soItem->qty_shipped - $qtyToShip,
-                    'unit_price'        => $soItem->unit_price,
-                ]);
-            }
-
-            if ($giStatus === 'completed') {
-                $this->completeGi($gi, $user);
-            }
-
-            if ($giStatus === 'cancelled') {
-                TransactionLog::create([
-                    'user_id'       => $user->id,
-                    'action'        => 'cancelled',
-                    'from_status'   => 'pending',
-                    'to_status'     => 'cancelled',
-                    'loggable_id'   => $gi->id,
-                    'loggable_type' => GoodsIssue::class,
-                ]);
-            }
-
-            return $gi;
-        };
-
-        // ── SO 1: Draft ────────────────────────────────────────────────────────
-        // Scenario: Customer submitted a quote request; SO saved as draft, pending review.
-        $createSo([
-            'customer_id'  => $customers->where('code', '100001')->first()->id,
-            'order_date'   => '2026-01-06',
-            'delivery_date'=> '2026-01-25',
-            'reference_no' => 'CUS-REF-001',
-            'remarks'      => 'Draft SO for Mega Construction – awaiting price approval',
-        ], [
-            ['material_id' => $materials->where('code', '300001')->first()->id, 'qty' => 80,  'unit_price' => 350.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300002')->first()->id, 'qty' => 120, 'unit_price' => 220.00, 'is_vatable' => true],
-        ], 'draft');
-
-        // ── SO 2: Draft – multi-item ───────────────────────────────────────────
-        // Scenario: Large draft order; several line items, pending management sign-off.
-        $createSo([
-            'customer_id'  => $customers->where('code', '100002')->first()->id,
-            'order_date'   => '2026-01-09',
-            'delivery_date'=> '2026-01-30',
-            'reference_no' => 'CUS-REF-002',
-            'remarks'      => 'Prime Builders – bulk order draft',
-        ], [
-            ['material_id' => $materials->where('code', '300003')->first()->id, 'qty' => 40,  'unit_price' => 850.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300005')->first()->id, 'qty' => 30,  'unit_price' => 1100.00,'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300007')->first()->id, 'qty' => 100, 'unit_price' => 165.00, 'is_vatable' => false],
-        ], 'draft');
-
-        // ── SO 3: Posted – awaiting GI ────────────────────────────────────────
-        // Scenario: SO confirmed and posted; warehouse preparing for dispatch.
-        $so3 = $createSo([
-            'customer_id'  => $customers->where('code', '100003')->first()->id,
-            'order_date'   => '2026-01-12',
-            'delivery_date'=> '2026-02-01',
-            'reference_no' => 'CUS-REF-003',
-            'remarks'      => 'Urban Dev – posted, awaiting warehouse dispatch',
-        ], [
-            ['material_id' => $materials->where('code', '300006')->first()->id, 'qty' => 200, 'unit_price' => 65.00,   'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300004')->first()->id, 'qty' => 20,  'unit_price' => 1600.00, 'is_vatable' => true],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so3->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        // ── SO 4: Posted – another open SO ────────────────────────────────────
-        // Scenario: Confirmed SO; customer requested delivery in two weeks.
-        $so4 = $createSo([
-            'customer_id'  => $customers->where('code', '100004')->first()->id,
-            'order_date'   => '2026-01-15',
-            'delivery_date'=> '2026-02-08',
-            'reference_no' => 'CUS-REF-004',
-        ], [
-            ['material_id' => $materials->where('code', '300001')->first()->id, 'qty' => 60, 'unit_price' => 350.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300008')->first()->id, 'qty' => 10, 'unit_price' => 1000.00,'is_vatable' => false],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so4->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        // ── SO 5: Partially shipped – first GI done ────────────────────────────
-        // Scenario: Customer ordered 150 steel rods; 80 shipped in first GI, 70 pending.
-        $so5 = $createSo([
-            'customer_id'  => $customers->where('code', '100005')->first()->id,
-            'order_date'   => '2026-01-16',
-            'delivery_date'=> '2026-02-10',
-            'reference_no' => 'CUS-REF-005',
-            'remarks'      => 'Heritage Homes – split delivery per site schedule',
-        ], [
-            ['material_id'  => $materials->where('code', '300001')->first()->id,
-             'qty'          => 150,
-             'unit_price'   => 350.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 80],
-            ['material_id'  => $materials->where('code', '300012')->first()->id,
-             'qty'          => 15,
-             'unit_price'   => 780.00,
-             'is_vatable'   => false,
-             'qty_shipped'  => 15],
-        ], 'partially_shipped');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so5->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so5Items = $so5->items()->get();
-
-        $gi5 = $createGi(
-            $so5,
-            [
-                $so5Items[0]->id => 80,   // partial on steel rods
-                $so5Items[1]->id => 15,   // full on sand
-            ],
-            $whnMnl,
-            'completed',
-            '2026-01-28',
-            'First shipment – 80 rods and full sand delivery'
-        );
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi5->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        // ── SO 6: Fully shipped – single GI ───────────────────────────────────
-        // Scenario: Complete order shipped in one go from Manila Warehouse.
-        $so6 = $createSo([
-            'customer_id'  => $customers->where('code', '100006')->first()->id,
-            'order_date'   => '2026-01-20',
-            'delivery_date'=> '2026-02-06',
-            'reference_no' => 'CUS-REF-006',
-            'remarks'      => 'Coastal Realty – single delivery, full order',
-        ], [
-            ['material_id'  => $materials->where('code', '300006')->first()->id,
-             'qty'          => 300,
-             'unit_price'   => 65.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 300],
-        ], 'fully_shipped');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so6->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so6Items = $so6->items()->get();
-
-        $gi6 = $createGi(
-            $so6,
-            [$so6Items[0]->id => 300],
-            $whnMnl,
-            'completed',
-            '2026-02-05',
-            'Full tile shipment – 300 pcs dispatched'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi6->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        // ── SO 7: Fully shipped – two GIs ─────────────────────────────────────
-        // Scenario: Large PVC order; delivered to site in two truck runs.
-        $so7 = $createSo([
-            'customer_id'  => $customers->where('code', '100007')->first()->id,
-            'order_date'   => '2026-01-22',
-            'delivery_date'=> '2026-02-15',
-            'reference_no' => 'CUS-REF-007',
-            'remarks'      => 'Metro Housing – PVC delivered in 2 trips',
-        ], [
-            ['material_id'  => $materials->where('code', '300007')->first()->id,
-             'qty'          => 200,
-             'unit_price'   => 165.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 200],
-        ], 'fully_shipped');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so7->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so7Items = $so7->items()->get();
-
-        $gi7a = $createGi(
-            $so7,
-            [$so7Items[0]->id => 100],
-            $whDav,
-            'completed',
-            '2026-02-08',
-            'Trip 1 – 100 PVC pipes dispatched to site'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi7a->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        $so7Items[0]->refresh();
-        $gi7b = $createGi(
-            $so7,
-            [$so7Items[0]->id => 100],
-            $whDav,
-            'completed',
-            '2026-02-15',
-            'Trip 2 – remaining 100 PVC pipes delivered'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi7b->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        // ── SO 8: Partially shipped – pending GI still open ───────────────────
-        // Scenario: First GI completed; second GI created but still pending.
-        $so8 = $createSo([
-            'customer_id'  => $customers->where('code', '100008')->first()->id,
-            'order_date'   => '2026-01-25',
-            'delivery_date'=> '2026-02-20',
-            'reference_no' => 'CUS-REF-008',
-            'remarks'      => 'Provincial Builders – paint batch delivery',
-        ], [
-            ['material_id'  => $materials->where('code', '300004')->first()->id,
-             'qty'          => 50,
-             'unit_price'   => 1600.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 25],
-        ], 'partially_shipped');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so8->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so8Items = $so8->items()->get();
-
-        $gi8Completed = $createGi(
-            $so8,
-            [$so8Items[0]->id => 25],
-            $stBgc,
-            'completed',
-            '2026-02-10',
-            'First batch – 25 paint cans dispatched from BGC store'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi8Completed->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        $so8Items[0]->refresh();
-        // Second GI – pending; customer site not ready yet
-        $createGi(
-            $so8,
-            [$so8Items[0]->id => 25],
-            $stBgc,
-            'pending',
-            '2026-02-20',
-            'Second batch – pending customer site clearance'
-        );
-
-        // ── SO 9: Cancelled – before any GI ───────────────────────────────────
-        // Scenario: Customer cancelled their project; SO voided with no stock movement.
-        $so9 = $createSo([
-            'customer_id'  => $customers->where('code', '100009')->first()->id,
-            'order_date'   => '2026-01-28',
-            'delivery_date'=> '2026-02-22',
-            'reference_no' => 'CUS-REF-009',
-            'remarks'      => 'Summit Construction – project cancelled by client',
-        ], [
-            ['material_id' => $materials->where('code', '300010')->first()->id, 'qty' => 20, 'unit_price' => 1650.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300009')->first()->id, 'qty' => 15, 'unit_price' => 2400.00, 'is_vatable' => true],
-        ], 'cancelled');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so9->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'cancelled',
-            'from_status'   => 'posted',
-            'to_status'     => 'cancelled',
-            'remarks'       => 'Customer project on hold; order voided',
-            'loggable_id'   => $so9->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        // ── SO 10: Cancelled – GI was completed then SO cancelled ──────────────
-        // Scenario: Partial shipment made; customer later cancelled remaining; SO closed.
-        $so10 = $createSo([
-            'customer_id'  => $customers->where('code', '100010')->first()->id,
-            'order_date'   => '2026-02-01',
-            'delivery_date'=> '2026-02-18',
-            'reference_no' => 'CUS-REF-010',
-            'remarks'      => 'Landmark Dev – partial shipment done, rest cancelled',
-        ], [
-            ['material_id'  => $materials->where('code', '300011')->first()->id,
-             'qty'          => 300,
-             'unit_price'   => 38.00,
-             'is_vatable'   => false,
-             'qty_shipped'  => 120],
-        ], 'cancelled');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so10->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so10Items = $so10->items()->get();
-
-        $gi10 = $createGi(
-            $so10,
-            [$so10Items[0]->id => 120],
-            $dcNth,
-            'completed',
-            '2026-02-10',
-            'Partial block delivery – 120 of 300 shipped'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi10->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'cancelled',
-            'from_status'   => 'partially_shipped',
-            'to_status'     => 'cancelled',
-            'remarks'       => 'Remaining quantity cancelled – customer revised scope',
-            'loggable_id'   => $so10->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        // ── SO 11: GI created then cancelled, SO back to posted ───────────────
-        // Scenario: GI was entered with wrong quantities; cancelled; SO remains posted.
-        $so11 = $createSo([
-            'customer_id'  => $customers->where('code', '100011')->first()->id,
-            'order_date'   => '2026-02-04',
-            'delivery_date'=> '2026-02-22',
-            'reference_no' => 'CUS-REF-011',
-            'remarks'      => 'Pacific Estates – GI cancelled due to wrong qty entry',
-        ], [
-            ['material_id' => $materials->where('code', '300005')->first()->id, 'qty' => 50, 'unit_price' => 1100.00, 'is_vatable' => true],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so11->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so11Items = $so11->items()->get();
-
-        $gi11 = $createGi(
-            $so11,
-            [$so11Items[0]->id => 50],
-            $stMak,
-            'cancelled',
-            '2026-02-15',
-            'Cancelled – incorrect qty; to be re-processed'
-        );
-
-        // ── SO 12: Fully shipped – BGC store, multi-item ──────────────────────
-        // Scenario: Walk-in bulk order fulfilled entirely from BGC store stock.
-        $so12 = $createSo([
-            'customer_id'  => $customers->where('code', '100012')->first()->id,
-            'order_date'   => '2026-02-06',
-            'delivery_date'=> '2026-02-20',
-            'reference_no' => 'CUS-REF-012',
-            'remarks'      => 'Green Valley – full order from BGC store',
-        ], [
-            ['material_id'  => $materials->where('code', '300004')->first()->id,
-             'qty'          => 10,
-             'unit_price'   => 1600.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 10],
-            ['material_id'  => $materials->where('code', '300010')->first()->id,
-             'qty'          => 8,
-             'unit_price'   => 1650.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 8],
-        ], 'fully_shipped');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so12->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so12Items = $so12->items()->get();
-
-        $gi12 = $createGi(
-            $so12,
-            [
-                $so12Items[0]->id => 10,
-                $so12Items[1]->id => 8,
-            ],
-            $stBgc,
-            'completed',
-            '2026-02-18',
-            'Full shipment – paint & glass panels from BGC'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi12->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        // ── SO 13: Posted – no delivery date, open-ended ──────────────────────
-        // Scenario: SO confirmed but delivery date flexible per customer request.
-        $so13 = $createSo([
-            'customer_id'  => $customers->where('code', '100013')->first()->id,
-            'order_date'   => '2026-02-10',
-            'delivery_date'=> null,
-            'reference_no' => 'CUS-REF-013',
-            'remarks'      => 'Elite Property – delivery date TBD',
-        ], [
-            ['material_id' => $materials->where('code', '300002')->first()->id, 'qty' => 100, 'unit_price' => 220.00, 'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300008')->first()->id, 'qty' => 8,   'unit_price' => 1000.00,'is_vatable' => false],
-        ], 'posted');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so13->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        // ── SO 14: Partially shipped – three-item, two shipped, one partial ────
-        // Scenario: Lumber and nails fully dispatched; cement only half out.
-        $so14 = $createSo([
-            'customer_id'  => $customers->where('code', '100011')->first()->id,
-            'order_date'   => '2026-02-13',
-            'delivery_date'=> '2026-03-05',
-            'reference_no' => 'CUS-REF-014',
-            'remarks'      => 'Prestige Homes – mixed dispatch schedule',
-        ], [
-            ['material_id'  => $materials->where('code', '300014')->first()->id,
-             'qty'          => 80,
-             'unit_price'   => 320.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 80],
-            ['material_id'  => $materials->where('code', '300013')->first()->id,
-             'qty'          => 20,
-             'unit_price'   => 240.00,
-             'is_vatable'   => false,
-             'qty_shipped'  => 20],
-            ['material_id'  => $materials->where('code', '300002')->first()->id,
-             'qty'          => 150,
-             'unit_price'   => 220.00,
-             'is_vatable'   => true,
-             'qty_shipped'  => 60],
-        ], 'partially_shipped');
-
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'posted',
-            'from_status'   => 'draft',
-            'to_status'     => 'posted',
-            'loggable_id'   => $so14->id,
-            'loggable_type' => SalesOrder::class,
-        ]);
-
-        $so14Items = $so14->items()->get();
-
-        $gi14 = $createGi(
-            $so14,
-            [
-                $so14Items[0]->id => 80,
-                $so14Items[1]->id => 20,
-                $so14Items[2]->id => 60,
-            ],
-            $whCeb,
-            'completed',
-            '2026-02-26',
-            'First dispatch – lumber & nails full, cement partial'
-        );
-        TransactionLog::create([
-            'user_id'       => $user->id,
-            'action'        => 'completed',
-            'from_status'   => 'pending',
-            'to_status'     => 'completed',
-            'loggable_id'   => $gi14->id,
-            'loggable_type' => GoodsIssue::class,
-        ]);
-
-        // ── SO 15: Draft – newest, not yet posted ─────────────────────────────
-        // Scenario: Most recent SO; just created, pending management review.
-        $createSo([
-            'customer_id'  => $customers->where('code', '100015')->first()->id,
-            'order_date'   => '2026-03-02',
-            'delivery_date'=> '2026-03-25',
-            'reference_no' => 'CUS-REF-015',
-            'remarks'      => 'Horizon Real Estate – new draft, under review',
-        ], [
-            ['material_id' => $materials->where('code', '300003')->first()->id, 'qty' => 30,  'unit_price' => 850.00,  'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300006')->first()->id, 'qty' => 500, 'unit_price' => 65.00,   'is_vatable' => true],
-            ['material_id' => $materials->where('code', '300007')->first()->id, 'qty' => 80,  'unit_price' => 165.00,  'is_vatable' => false],
-        ], 'draft');
+        $this->asAdministrator(function (): void {
+            $this->draftOrders();
+            $this->postedOrders();
+            $this->shippedOrders();
+            $this->cancelledAndRevertedOrders();
+        });
     }
 
-    // ── Internal: complete a GI (deduct inventory + update SO item qty_shipped) ─
+    // ── Scenario groups ──────────────────────────────────────────────────────
 
-    private function completeGi(GoodsIssue $gi, $user): void
+    private function draftOrders(): void
     {
-        foreach ($gi->items as $item) {
-            $soItem = $item->salesOrderItem;
+        // 1 - quotation just turned into an order, still a draft.
+        $this->createOrder([
+            'customer' => '100001',
+            'order_date' => $this->daysAgo(2),
+            'delivery_date' => $this->daysAhead(10),
+            'reference_no' => 'SQ-3001',
+            'remarks' => 'Steel rods for the Ortigas project - pending customer PO.',
+            'items' => [
+                ['material' => '300001', 'qty' => 60, 'unit_price' => 350, 'vat' => 'exclusive'],
+            ],
+        ]);
 
-            // Update SO item qty_shipped
-            $soItem->increment('qty_shipped', $item->qty_to_ship);
+        // 2 - trade pricing: line discounts, a header discount and a rebate.
+        $this->createOrder([
+            'customer' => '100002',
+            'order_date' => $this->daysAgo(1),
+            'delivery_date' => $this->daysAhead(12),
+            'reference_no' => 'SQ-3002',
+            'remarks' => 'Contractor pricing with a loyalty rebate.',
+            'discount' => ['percentage', 3],
+            'charges' => ['Delivery Charge', 'Loyalty Discount (3%)'],
+            'items' => [
+                ['material' => '300002', 'qty' => 150, 'unit_price' => 260, 'vat' => 'exclusive', 'discount' => ['percentage', 4]],
+                ['material' => '300006', 'qty' => 200, 'unit_price' => 65, 'vat' => 'exclusive', 'discount' => ['fixed', 2]],
+                ['material' => '300011', 'qty' => 120, 'unit_price' => 42, 'remarks' => 'Non-vatable government project line.'],
+            ],
+        ]);
 
-            // Deduct inventory
-            $inventory = Inventory::where('material_id', $item->material_id)
-                ->where('location_id', $gi->location_id)
-                ->first();
+        // 13 - mixed VAT treatment with percentage charges both ways.
+        $this->createOrder([
+            'customer' => '100013',
+            'order_date' => $this->daysAgo(4),
+            'delivery_date' => $this->daysAhead(15),
+            'reference_no' => 'SQ-3013',
+            'remarks' => 'Retail fit-out: fixtures VAT inclusive, hardware exclusive.',
+            'charges' => ['Installation Fee', 'Senior Citizen Discount (20%)'],
+            'items' => [
+                ['material' => '300009', 'qty' => 10, 'unit_price' => 2450, 'vat' => 'inclusive'],
+                ['material' => '300010', 'qty' => 8, 'unit_price' => 1650, 'vat' => 'exclusive'],
+                ['material' => '300013', 'qty' => 25, 'unit_price' => 240],
+            ],
+        ]);
+    }
 
-            if (!$inventory) {
-                // Guard – shouldn't happen in a properly seeded environment
+    private function postedOrders(): void
+    {
+        // 3 - confirmed with the customer, nothing picked yet.
+        $order = $this->createOrder([
+            'customer' => '100003',
+            'order_date' => $this->daysAgo(11),
+            'delivery_date' => $this->daysAhead(5),
+            'reference_no' => 'SO-REF-3003',
+            'remarks' => 'Plywood and hardware for a Quezon City fit-out.',
+            'items' => [
+                ['material' => '300003', 'qty' => 40, 'unit_price' => 850, 'vat' => 'exclusive'],
+                ['material' => '300005', 'qty' => 30, 'unit_price' => 520, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+
+        // 4 - picking list prepared: stock is reserved but still on hand.
+        $order = $this->createOrder([
+            'customer' => '100004',
+            'order_date' => $this->daysAgo(9),
+            'delivery_date' => $this->daysAhead(3),
+            'reference_no' => 'SO-REF-3004',
+            'remarks' => 'Truck scheduled for tomorrow morning.',
+            'charges' => ['Delivery Charge'],
+            'items' => [
+                ['material' => '300006', 'qty' => 300, 'unit_price' => 68, 'vat' => 'exclusive'],
+                ['material' => '300007', 'qty' => 80, 'unit_price' => 145, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(1),
+            'remarks' => 'Picked and staged at the loading bay.',
+            'lines' => ['300006' => 300, '300007' => 80],
+        ]);
+    }
+
+    private function shippedOrders(): void
+    {
+        // 5 - first delivery covered part of the order.
+        $order = $this->createOrder([
+            'customer' => '100005',
+            'order_date' => $this->daysAgo(22),
+            'delivery_date' => $this->daysAgo(3),
+            'reference_no' => 'SO-REF-3005',
+            'remarks' => 'Customer accepted a staged delivery.',
+            'items' => [
+                ['material' => '300001', 'qty' => 100, 'unit_price' => 355, 'vat' => 'exclusive'],
+                ['material' => '300002', 'qty' => 200, 'unit_price' => 258, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(5),
+            'complete' => true,
+            'remarks' => 'Steel delivered in full, cement half delivered.',
+            'lines' => ['300001' => 100, '300002' => 100],
+        ]);
+
+        // 6 - single full delivery.
+        $order = $this->createOrder([
+            'customer' => '100006',
+            'order_date' => $this->daysAgo(27),
+            'delivery_date' => $this->daysAgo(16),
+            'reference_no' => 'SO-REF-3006',
+            'remarks' => 'Cebu branch order, delivered complete.',
+            'charges' => ['Delivery Charge'],
+            'items' => [
+                ['material' => '300001', 'qty' => 50, 'unit_price' => 360, 'vat' => 'exclusive'],
+                ['material' => '300002', 'qty' => 120, 'unit_price' => 262, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-CEB',
+            'date' => $this->daysAgo(16),
+            'complete' => true,
+            'remarks' => 'Delivered complete from the Cebu warehouse.',
+            'lines' => ['300001' => 50, '300002' => 120],
+        ]);
+
+        // 7 - shipped in two deliveries out of two warehouses.
+        $order = $this->createOrder([
+            'customer' => '100007',
+            'order_date' => $this->daysAgo(25),
+            'delivery_date' => $this->daysAgo(8),
+            'reference_no' => 'SO-REF-3007',
+            'remarks' => 'Split shipment: Manila first, Davao to follow.',
+            'items' => [
+                ['material' => '300006', 'qty' => 500, 'unit_price' => 66, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(15),
+            'complete' => true,
+            'remarks' => 'First 300 bags out of Manila.',
+            'lines' => ['300006' => 300],
+        ]);
+        $this->ship($order, [
+            'location' => 'WH-DAV',
+            'date' => $this->daysAgo(8),
+            'complete' => true,
+            'remarks' => 'Remaining 200 bags out of Davao.',
+            'lines' => ['300006' => 200],
+        ]);
+
+        // 8 - part shipped, part still on a pending issue.
+        $order = $this->createOrder([
+            'customer' => '100008',
+            'order_date' => $this->daysAgo(14),
+            'delivery_date' => $this->daysAhead(2),
+            'reference_no' => 'SO-REF-3008',
+            'remarks' => 'Tiles going out in two truckloads.',
+            'items' => [
+                ['material' => '300014', 'qty' => 180, 'unit_price' => 330, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'HUB-CLK',
+            'date' => $this->daysAgo(7),
+            'complete' => true,
+            'remarks' => 'First truckload dispatched from Clark.',
+            'lines' => ['300014' => 100],
+        ]);
+        $this->ship($order, [
+            'location' => 'HUB-CLK',
+            'date' => $this->daysAhead(1),
+            'remarks' => 'Second truckload booked for tomorrow.',
+            'lines' => ['300014' => 80],
+        ]);
+
+        // 14 - three lines: two complete, one short.
+        $order = $this->createOrder([
+            'customer' => '100014',
+            'order_date' => $this->daysAgo(20),
+            'delivery_date' => $this->daysAgo(6),
+            'reference_no' => 'SO-REF-3014',
+            'remarks' => 'Mixed order for a subdivision project.',
+            'charges' => ['Handling Fee', 'Bulk Order Discount (10%)'],
+            'items' => [
+                ['material' => '300011', 'qty' => 300, 'unit_price' => 45],
+                ['material' => '300013', 'qty' => 40, 'unit_price' => 245],
+                ['material' => '300002', 'qty' => 100, 'unit_price' => 259, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'DC-NTH',
+            'date' => $this->daysAgo(6),
+            'complete' => true,
+            'remarks' => 'Blocks and nails complete, cement partly delivered.',
+            'lines' => ['300011' => 300, '300013' => 30, '300002' => 60],
+        ]);
+
+        // 15 - serial and batch references captured on the issue.
+        $order = $this->createOrder([
+            'customer' => '100010',
+            'order_date' => $this->daysAgo(18),
+            'delivery_date' => $this->daysAgo(11),
+            'reference_no' => 'SO-REF-3010',
+            'remarks' => 'Serial tracked equipment sale.',
+            'items' => [
+                ['material' => '300012', 'qty' => 6, 'unit_price' => 3200, 'vat' => 'exclusive'],
+                ['material' => '300015', 'qty' => 40, 'unit_price' => 430, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(11),
+            'complete' => true,
+            'remarks' => 'Serial numbers recorded on the delivery receipt.',
+            'lines' => [
+                '300012' => ['qty' => 6, 'serial_number' => 'SN-2450-0001..0006', 'remarks' => 'Warranty registered for the customer.'],
+                '300015' => ['qty' => 40, 'batch_number' => 'BATCH-A7734'],
+            ],
+        ]);
+    }
+
+    private function cancelledAndRevertedOrders(): void
+    {
+        // 9 - cancelled before anything shipped.
+        $order = $this->createOrder([
+            'customer' => '100011',
+            'order_date' => $this->daysAgo(17),
+            'delivery_date' => $this->daysAgo(2),
+            'reference_no' => 'SO-REF-3011',
+            'remarks' => 'Cancelled: customer postponed the project.',
+            'items' => [
+                ['material' => '300005', 'qty' => 25, 'unit_price' => 530, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->orders->cancel($order);
+
+        // 10 - shipped, then cancelled: the issue is cancelled with the order
+        //      and the stock comes back in.
+        $order = $this->createOrder([
+            'customer' => '100012',
+            'order_date' => $this->daysAgo(21),
+            'delivery_date' => $this->daysAgo(13),
+            'reference_no' => 'SO-REF-3012',
+            'remarks' => 'Delivery refused on site and returned to the warehouse.',
+            'items' => [
+                ['material' => '300004', 'qty' => 10, 'unit_price' => 1650, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(13),
+            'complete' => true,
+            'remarks' => 'Delivered, then refused by the site engineer.',
+            'lines' => ['300004' => 10],
+        ]);
+        $this->orders->cancel($order);
+
+        // 11 - posted, then pulled back to draft to re-price.
+        $order = $this->createOrder([
+            'customer' => '100009',
+            'order_date' => $this->daysAgo(6),
+            'delivery_date' => $this->daysAhead(8),
+            'reference_no' => 'SO-REF-3009',
+            'remarks' => 'Reverted to draft: customer asked for a revised quote.',
+            'items' => [
+                ['material' => '300003', 'qty' => 35, 'unit_price' => 870, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->orders->revert($order);
+
+        // 12 - cancelled, then restored with its pending issue reopened.
+        $order = $this->createOrder([
+            'customer' => '100015',
+            'order_date' => $this->daysAgo(13),
+            'delivery_date' => $this->daysAhead(4),
+            'reference_no' => 'SO-REF-3015',
+            'remarks' => 'Cancelled in error, restored after the customer confirmed.',
+            'items' => [
+                ['material' => '300002', 'qty' => 80, 'unit_price' => 261, 'vat' => 'exclusive'],
+            ],
+        ]);
+        $this->orders->post($order);
+        $this->ship($order, [
+            'location' => 'WH-MNL',
+            'date' => $this->daysAgo(1),
+            'remarks' => 'Picking list held while the order was on hold.',
+            'lines' => ['300002' => 80],
+        ]);
+        $this->orders->cancel($order);
+        $this->orders->revert($order);
+    }
+
+    // ── Builders ─────────────────────────────────────────────────────────────
+
+    /**
+     * @param  array<string, mixed>  $spec
+     */
+    private function createOrder(array $spec): SalesOrder
+    {
+        [$discountType, $discountAmount] = $spec['discount'] ?? [null, 0];
+
+        return $this->orders->create(SalesOrderData::fromArray([
+            'customer_id' => $this->customerId($spec['customer']),
+            'order_date' => $spec['order_date'],
+            'delivery_date' => $spec['delivery_date'] ?? null,
+            'reference_no' => $spec['reference_no'] ?? null,
+            'discount_type' => $discountType,
+            'discount_amount' => $discountAmount,
+            'remarks' => $spec['remarks'] ?? null,
+            'items' => $this->itemRows($spec['items']),
+            'charges' => $this->chargeRows($spec['charges'] ?? []),
+        ]));
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $items
+     * @return array<int, array<string, mixed>>
+     */
+    private function itemRows(array $items): array
+    {
+        $rows = [];
+
+        foreach ($items as $item) {
+            $materialId = $this->materialId($item['material']);
+
+            if ($materialId === null) {
                 continue;
             }
 
-            $before = (float) $inventory->quantity;
-            $change = (float) $item->qty_to_ship;
-            $after  = max(0, $before - $change);
+            [$discountType, $discountAmount] = $item['discount'] ?? [null, 0];
 
-            $inventory->update(['quantity' => $after]);
-
-            InventoryLog::create([
-                'movement_code'  => InventoryLog::generateMovementCode(),
-                'inventory_id'   => $inventory->id,
-                'material_id'    => $item->material_id,
-                'location_id'    => $gi->location_id,
-                'user_id'        => $user->id,
-                'type'           => 'sales_issue',
-                'quantity_before'=> $before,
-                'quantity_change'=> -$change,
-                'quantity_after' => $after,
-                'reference_id'   => $gi->id,
-                'reference_type' => GoodsIssue::class,
-                'remarks'        => 'Goods issue: ' . $gi->code,
-            ]);
+            $rows[] = [
+                'material_id' => $materialId,
+                'qty_ordered' => $item['qty'],
+                'unit_price' => $item['unit_price'],
+                'discount_type' => $discountType,
+                'discount_amount' => $discountAmount,
+                'is_vatable' => isset($item['vat']),
+                'vat_type' => $item['vat'] ?? null,
+                'vat_rate' => isset($item['vat']) ? 12 : 0,
+                'remarks' => $item['remarks'] ?? null,
+            ];
         }
+
+        return $rows;
+    }
+
+    /**
+     * Raise a goods issue against an order and optionally complete it.
+     *
+     * Each line is capped at the quantity the location can actually promise,
+     * so a thin opening balance produces a smaller sample document instead of
+     * failing the seed.
+     *
+     * @param  array<string, mixed>  $spec
+     */
+    private function ship(SalesOrder $order, array $spec): ?GoodsIssue
+    {
+        $order->refresh()->load('items');
+
+        $locationId = $this->locationId($spec['location']);
+
+        if ($locationId === null) {
+            return null;
+        }
+
+        $items = [];
+
+        foreach ($spec['lines'] as $materialCode => $line) {
+            $orderItem = $order->items->firstWhere('material_id', $this->materialId($materialCode));
+
+            if ($orderItem === null) {
+                continue;
+            }
+
+            $line = is_array($line) ? $line : ['qty' => $line];
+
+            $available = $this->inventory->availableQuantity($orderItem->material_id, $locationId);
+            $quantity = Money::quantity(min($line['qty'], $available));
+
+            if ($quantity <= 0) {
+                $this->command?->warn(sprintf(
+                    '%s: skipped %s on %s - no stock available at %s.',
+                    static::class,
+                    $materialCode,
+                    $order->code,
+                    $spec['location'],
+                ));
+
+                continue;
+            }
+
+            $items[] = [
+                'sales_order_item_id' => $orderItem->id,
+                'qty_to_ship' => $quantity,
+                'serial_number' => $line['serial_number'] ?? null,
+                'batch_number' => $line['batch_number'] ?? null,
+                'remarks' => $line['remarks'] ?? null,
+            ];
+        }
+
+        if ($items === []) {
+            return null;
+        }
+
+        $issue = $this->issues->create($order, GoodsIssueData::fromArray([
+            'sales_order_id' => $order->id,
+            'location_id' => $locationId,
+            'gi_date' => $spec['date'],
+            'transaction_date' => $spec['date'],
+            'remarks' => $spec['remarks'] ?? null,
+            'items' => $items,
+        ]));
+
+        if ($spec['complete'] ?? false) {
+            $issue = $this->issues->complete($issue);
+        }
+
+        return $issue;
     }
 }

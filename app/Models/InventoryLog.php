@@ -2,8 +2,22 @@
 
 namespace App\Models;
 
+use App\Enums\InventoryMovementType;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\MorphTo;
+use Illuminate\Support\Facades\DB;
 
+/**
+ * One stock movement.
+ *
+ * Every row carries the before/change/after triplet, so the ledger can be
+ * replayed and reconciled against `inventories.quantity`. Rows are written
+ * exclusively by InventoryService and are never edited afterwards.
+ *
+ * @property InventoryMovementType $type
+ */
 class InventoryLog extends Model
 {
     protected $fillable = [
@@ -22,57 +36,117 @@ class InventoryLog extends Model
         'remarks',
     ];
 
-    protected $casts = [
-        'quantity_before' => 'decimal:2',
-        'quantity_change' => 'decimal:2',
-        'quantity_after'  => 'decimal:2',
-    ];
-
-    public static function generateMovementCode(): string
+    protected function casts(): array
     {
-        $yy = now()->format('y');   // 26
-        $mm = now()->format('m');   // 01
-
-        $prefix = '5' . $yy . $mm; // 52601
-
-        $last = self::where('movement_code', 'like', $prefix . '%')
-            ->orderBy('id', 'desc')
-            ->first();
-
-        $nextNumber = $last
-            ? ((int) substr($last->movement_code, -4)) + 1
-            : 1;
-
-        return $prefix . str_pad($nextNumber, 4, '0', STR_PAD_LEFT);
+        return [
+            'type' => InventoryMovementType::class,
+            'quantity_before' => 'decimal:2',
+            'quantity_change' => 'decimal:2',
+            'quantity_after' => 'decimal:2',
+        ];
     }
 
-    public function inventory()
+    /**
+     * Movement code in the form `5` + `yymm` + a monthly sequence.
+     *
+     * Like the document codes, the sequence is read under a lock when a
+     * transaction is open so two concurrent movements cannot claim the same
+     * number (the column is unique).
+     */
+    public static function generateMovementCode(): string
+    {
+        $prefix = '5'.now()->format('ym');
+
+        $query = static::query()
+            ->where('movement_code', 'like', $prefix.'%')
+            ->orderByDesc('movement_code');
+
+        if (DB::transactionLevel() > 0) {
+            $query->lockForUpdate();
+        }
+
+        $lastCode = $query->value('movement_code');
+
+        $next = $lastCode === null ? 1 : ((int) substr($lastCode, -4)) + 1;
+
+        return $prefix.str_pad((string) $next, 4, '0', STR_PAD_LEFT);
+    }
+
+    // ── Relations ────────────────────────────────────────────────────────────
+
+    public function inventory(): BelongsTo
     {
         return $this->belongsTo(Inventory::class)->withTrashed();
     }
 
-    public function material()
+    public function material(): BelongsTo
     {
         return $this->belongsTo(Material::class);
     }
 
-    public function location()
+    public function location(): BelongsTo
     {
         return $this->belongsTo(Location::class);
     }
 
-    public function user()
-    {
-        return $this->belongsTo(User::class);
-    }
-
-    public function transferLocation()
+    public function transferLocation(): BelongsTo
     {
         return $this->belongsTo(Location::class, 'transfer_location_id');
     }
 
-    public function reference()
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    /** The document that caused the movement, when there is one. */
+    public function reference(): MorphTo
     {
         return $this->morphTo();
+    }
+
+    // ── Scopes ───────────────────────────────────────────────────────────────
+
+    /**
+     * @param  Builder<static>  $query
+     * @param  InventoryMovementType|array<int, InventoryMovementType>  $type
+     */
+    public function scopeOfType(Builder $query, InventoryMovementType|array $type): void
+    {
+        $values = collect(is_array($type) ? $type : [$type])
+            ->map(fn (InventoryMovementType $case): string => $case->value)
+            ->all();
+
+        $query->whereIn('type', $values);
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     */
+    public function scopeForMaterial(Builder $query, int $materialId): void
+    {
+        $query->where('material_id', $materialId);
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     */
+    public function scopeForLocation(Builder $query, int $locationId): void
+    {
+        $query->where('location_id', $locationId);
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     */
+    public function scopeBetweenDates(Builder $query, ?string $from, ?string $to): void
+    {
+        $query->when($from, fn (Builder $q) => $q->whereDate('created_at', '>=', $from))
+            ->when($to, fn (Builder $q) => $q->whereDate('created_at', '<=', $to));
+    }
+
+    public function isInbound(): bool
+    {
+        return (float) $this->quantity_change > 0;
     }
 }

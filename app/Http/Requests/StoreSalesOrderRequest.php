@@ -2,36 +2,86 @@
 
 namespace App\Http\Requests;
 
+use App\Data\SalesOrderData;
+use App\Enums\RecordStatus;
+use App\Http\Requests\Concerns\ValidatesOrderPayload;
+use App\Models\SalesOrder;
 use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
 
+/**
+ * Validates a new sales order.
+ */
 class StoreSalesOrderRequest extends FormRequest
 {
-    public function authorize(): bool { return true; }
+    use ValidatesOrderPayload;
 
+    public function authorize(): bool
+    {
+        return $this->user()?->can('create', SalesOrder::class) ?? false;
+    }
+
+    protected function prepareForValidation(): void
+    {
+        $this->normaliseOrderPayload();
+    }
+
+    /**
+     * @return array<string, array<int, mixed>>
+     */
     public function rules(): array
     {
         return [
-            'customer_id'     => ['required', 'exists:customers,id'],
-            'order_date'      => ['required', 'date'],
-            'delivery_date'   => ['nullable', 'date', 'after_or_equal:order_date'],
-            'reference_no'    => ['nullable', 'string', 'max:255'],
-            'discount_type'   => ['nullable', 'in:fixed,percentage'],
-            'discount_amount' => ['nullable', 'numeric', 'min:0'],
-            'remarks'         => ['nullable', 'string'],
-
-            'items'                           => ['required', 'array', 'min:1'],
-            'items.*.material_id'             => ['required', 'exists:materials,id'],
-            'items.*.qty_ordered'             => ['required', 'numeric', 'min:0.000001'],
-            'items.*.unit_price'              => ['required', 'numeric', 'min:0'],
-            'items.*.discount_type'           => ['nullable', 'in:fixed,percentage'],
-            'items.*.discount_amount'         => ['nullable', 'numeric', 'min:0'],
-            'items.*.is_vatable'              => ['boolean'],
-            'items.*.vat_type'                => ['nullable', 'in:exclusive,inclusive'],
-            'items.*.vat_rate'                => ['nullable', 'numeric', 'min:0'],
-            'items.*.remarks'                 => ['nullable', 'string'],
-
-            'charges'                         => ['nullable', 'array'],
-            'charges.*.charge_id'             => ['required', 'exists:charges,id'],
+            'customer_id' => [
+                'required',
+                'integer',
+                Rule::exists('customers', 'id')->where('status', RecordStatus::Active->value),
+            ],
+            ...$this->headerRules(),
+            ...$this->lineRules(),
         ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function messages(): array
+    {
+        return [
+            'customer_id.exists' => 'Select an active customer.',
+            ...$this->orderMessages(),
+        ];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function attributes(): array
+    {
+        return [
+            'customer_id' => 'customer',
+            ...$this->orderAttributes(),
+        ];
+    }
+
+    /**
+     * @return array<int, callable>
+     */
+    public function after(): array
+    {
+        return $this->orderAfterHooks();
+    }
+
+    /**
+     * The validated payload, ready for SalesOrderService.
+     */
+    public function toData(): SalesOrderData
+    {
+        return SalesOrderData::fromRequest($this);
+    }
+
+    protected function unitKey(): string
+    {
+        return 'unit_price';
     }
 }

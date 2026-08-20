@@ -25,7 +25,7 @@ export default function Welcome() {
                                 {getAppName()}
                             </h1>
                             <p className="mb-2 text-[#706f6c] dark:text-[#A1A09A]">
-                                A modern ERP system for small to mid-sized businesses.
+                                A web application for small to mid-sized businesses.
                             </p>
                             <ul className="mb-4 flex flex-col lg:mb-6">
                                 <li className="relative flex items-center gap-4 py-2 before:absolute before:top-1/2 before:bottom-0 before:left-[0.4rem] before:border-l before:border-[#e3e3e0] dark:before:border-[#3E3E3A]">

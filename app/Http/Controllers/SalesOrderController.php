@@ -8,464 +8,156 @@ use App\Models\Charge;
 use App\Models\Customer;
 use App\Models\Material;
 use App\Models\SalesOrder;
-use App\Models\SalesOrderItem;
-use App\Models\GoodsIssue;
-use App\Models\Inventory;
-use App\Models\InventoryLog;
-use Illuminate\Routing\Controllers\HasMiddleware;
-use Illuminate\Routing\Controllers\Middleware;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\DB;
+use App\Services\SalesOrderService;
+use Illuminate\Http\RedirectResponse;
 use Inertia\Inertia;
+use Inertia\Response;
 
-class SalesOrderController extends Controller implements HasMiddleware
+/**
+ * HTTP entry points for sales orders.
+ *
+ * Mirrors PurchaseOrderController: authorize through SalesOrderPolicy, hand
+ * the validated data object to SalesOrderService, redirect. No business rules
+ * and no writes here.
+ */
+class SalesOrderController extends Controller
 {
-    public static function middleware(): array
-    {
-        return [
-            new Middleware('permission:sales-order-view',   only: ['index', 'show']),
-            new Middleware('permission:sales-order-create', only: ['create', 'store']),
-            new Middleware('permission:sales-order-edit',   only: ['edit', 'update']),
-            new Middleware('permission:sales-order-delete', only: ['destroy']),
-            new Middleware('permission:sales-order-post',   only: ['post']),
-            new Middleware('permission:sales-order-cancel', only: ['cancel']),
-            new Middleware('permission:sales-order-revert', only: ['revert']),
-        ];
-    }
+    public function __construct(private readonly SalesOrderService $orders) {}
 
-    public function index()
+    public function index(): Response
     {
-        $sos = SalesOrder::with(['customer', 'user'])
-            ->latest()
-            ->get();
+        $this->authorize('viewAny', SalesOrder::class);
 
         return Inertia::render('sales/sales-order/index', [
-            'salesOrders' => $sos,
+            'salesOrders' => SalesOrder::query()
+                ->with(['customer', 'user:id,name'])
+                ->latest()
+                ->get(),
         ]);
     }
 
-    public function create()
+    public function create(): Response
     {
-        $customers = Customer::where('status', 'active')->get();
-        $materials = Material::where('status', 'active')
-            ->with(['brand', 'category', 'uom'])
-            ->get();
-        $charges = Charge::where('status', 'active')->get();
+        $this->authorize('create', SalesOrder::class);
 
-        return Inertia::render('sales/sales-order/create', [
-            'customers' => $customers,
-            'materials' => $materials,
-            'charges'   => $charges,
-        ]);
+        return Inertia::render('sales/sales-order/create', $this->formOptions());
     }
 
-    public function store(StoreSalesOrderRequest $request)
+    public function store(StoreSalesOrderRequest $request): RedirectResponse
     {
-        DB::transaction(function () use ($request) {
-            $so = SalesOrder::create([
-                'customer_id'    => $request->customer_id,
-                'user_id'        => Auth::id(),
-                'status'         => 'draft',
-                'order_date'     => $request->order_date,
-                'delivery_date'  => $request->delivery_date,
-                'reference_no'   => $request->reference_no,
-                'discount_type'  => $request->discount_type,
-                'discount_amount'=> $request->discount_amount ?? 0,
-                'remarks'        => $request->remarks,
-            ]);
+        $order = $this->orders->create($request->toData());
 
-            $this->syncItems($so, $request->items);
-            $this->syncCharges($so, $request->charges ?? []);
-            $this->recalculateTotals($so);
-
-            $so->logs()->create([
-                'user_id'   => Auth::id(),
-                'action'    => 'created',
-                'to_status' => 'draft',
-                'remarks'   => 'Sales order created',
-            ]);
-        });
-
-        return redirect()->route('sales-orders.index')
-            ->with('success', 'Sales order created successfully.');
+        return redirect()
+            ->route('sales-orders.show', $order->id)
+            ->with('success', "Sales order {$order->code} created successfully.");
     }
 
-    public function show(SalesOrder $salesOrder)
+    public function show(SalesOrder $salesOrder): Response
     {
+        $this->authorize('view', $salesOrder);
+
         $salesOrder->load([
-            'customer', 'user',
-            'items.material',
+            'customer',
+            'user:id,name',
+            'items.material.uom',
             'charges.charge',
             'goodsIssues.location',
-            'goodsIssues.user',
-            'logs.user',
+            'goodsIssues.user:id,name',
+            'logs.user:id,name',
         ]);
 
         return Inertia::render('sales/sales-order/show', [
             'salesOrder' => $salesOrder,
+            'can' => $salesOrder->actionFlags(),
         ]);
     }
 
-    public function edit(SalesOrder $salesOrder)
+    public function edit(SalesOrder $salesOrder): Response|RedirectResponse
     {
-        if (!$salesOrder->canBeEdited()) {
-            return redirect()->route('sales-orders.show', $salesOrder->id)
-                ->withErrors(['error' => 'Only draft sales orders can be edited.']);
-        }
+        $this->authorize('update', $salesOrder);
 
-        $customers = Customer::where('status', 'active')->get();
-        $materials = Material::where('status', 'active')
-            ->with(['brand', 'category', 'uom'])
-            ->get();
-        $charges = Charge::where('status', 'active')->get();
+        if (! $salesOrder->canBeEdited()) {
+            return redirect()
+                ->route('sales-orders.show', $salesOrder->id)
+                ->with('error', 'Only draft sales orders can be edited.');
+        }
 
         $salesOrder->load(['customer', 'items.material', 'charges']);
 
         return Inertia::render('sales/sales-order/edit', [
             'salesOrder' => $salesOrder,
-            'customers'  => $customers,
-            'materials'  => $materials,
-            'charges'    => $charges,
+            ...$this->formOptions(),
         ]);
     }
 
-    public function update(UpdateSalesOrderRequest $request, SalesOrder $salesOrder)
+    public function update(UpdateSalesOrderRequest $request, SalesOrder $salesOrder): RedirectResponse
     {
-        if (!$salesOrder->canBeEdited()) {
-            return redirect()->route('sales-orders.show', $salesOrder->id)
-                ->withErrors(['error' => 'Only draft sales orders can be edited.']);
-        }
+        $this->orders->update($salesOrder, $request->toData());
 
-        DB::transaction(function () use ($request, $salesOrder) {
-            $salesOrder->update([
-                'customer_id'    => $request->customer_id,
-                'order_date'     => $request->order_date,
-                'delivery_date'  => $request->delivery_date,
-                'reference_no'   => $request->reference_no,
-                'discount_type'  => $request->discount_type,
-                'discount_amount'=> $request->discount_amount ?? 0,
-                'remarks'        => $request->remarks,
-            ]);
-
-            $this->syncItems($salesOrder, $request->items);
-            $this->syncCharges($salesOrder, $request->charges ?? []);
-            $this->recalculateTotals($salesOrder);
-
-            $salesOrder->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'updated',
-                'from_status' => $salesOrder->status,
-                'to_status'   => $salesOrder->status,
-                'remarks'     => 'Sales order updated',
-            ]);
-        });
-
-        return redirect()->route('sales-orders.show', $salesOrder->id)
-            ->with('success', 'Sales order updated successfully.');
+        return redirect()
+            ->route('sales-orders.show', $salesOrder->id)
+            ->with('success', "Sales order {$salesOrder->code} updated successfully.");
     }
 
-    public function destroy(SalesOrder $salesOrder)
+    public function destroy(SalesOrder $salesOrder): RedirectResponse
     {
-        if ($salesOrder->status !== 'draft') {
-            return redirect()->route('sales-orders.index')
-                ->withErrors(['error' => 'Only draft sales orders can be deleted.']);
-        }
+        $this->authorize('delete', $salesOrder);
 
-        DB::transaction(function () use ($salesOrder) {
-            // Delete all pending GIs (draft SO can only have pending GIs)
-            foreach ($salesOrder->goodsIssues as $gi) {
-                $gi->items()->delete();
-                $gi->logs()->delete();
-                $gi->delete();
-            }
+        $code = $salesOrder->code;
 
-            $salesOrder->delete();
-        });
+        $this->orders->delete($salesOrder);
 
-        return redirect()->route('sales-orders.index')
-            ->with('success', 'Sales order deleted successfully.');
+        return redirect()
+            ->route('sales-orders.index')
+            ->with('success', "Sales order {$code} deleted successfully.");
     }
 
-    // ── Status Actions ────────────────────────────────────────────────────────
+    // ── Status actions ───────────────────────────────────────────────────────
 
-    public function post(SalesOrder $salesOrder)
+    public function post(SalesOrder $salesOrder): RedirectResponse
     {
-        if (!$salesOrder->canBePosted()) {
-            return back()->withErrors(['error' => 'Sales order cannot be posted.']);
-        }
+        $this->authorize('post', $salesOrder);
 
-        DB::transaction(function () use ($salesOrder) {
-            $salesOrder->update(['status' => 'posted']);
-            $salesOrder->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'posted',
-                'from_status' => 'draft',
-                'to_status'   => 'posted',
-                'remarks'     => 'Sales order posted',
-            ]);
-        });
+        $this->orders->post($salesOrder);
 
-        return redirect()->route('sales-orders.show', $salesOrder->id)
-            ->with('success', 'Sales order posted successfully.');
+        return redirect()
+            ->route('sales-orders.show', $salesOrder->id)
+            ->with('success', "Sales order {$salesOrder->code} posted successfully.");
     }
 
-    public function cancel(SalesOrder $salesOrder)
+    public function cancel(SalesOrder $salesOrder): RedirectResponse
     {
-        if (!$salesOrder->canBeCancelled()) {
-            return back()->withErrors(['error' => 'Sales order cannot be cancelled.']);
-        }
+        $this->authorize('cancel', $salesOrder);
 
-        DB::transaction(function () use ($salesOrder) {
-            $fromStatus = $salesOrder->status;
+        $this->orders->cancel($salesOrder);
 
-            // Cancel all non-cancelled GIs
-            foreach ($salesOrder->goodsIssues()->whereNotIn('status', ['cancelled'])->get() as $gi) {
-                $giFromStatus = $gi->status;
-
-                // Restore inventory if completed
-                if ($giFromStatus === 'completed') {
-                    foreach ($gi->items as $giItem) {
-                        $qtyToRestore = (float) $giItem->qty_to_ship;
-                        if ($qtyToRestore <= 0) continue;
-
-                        $inventory = Inventory::where('material_id', $giItem->material_id)
-                            ->where('location_id', $gi->location_id)
-                            ->first();
-
-                        if ($inventory) {
-                            $qtyBefore = (float) $inventory->quantity;
-                            $newQty    = $qtyBefore + $qtyToRestore;
-                            $inventory->update(['quantity' => $newQty]);
-
-                            InventoryLog::create([
-                                'movement_code'   => InventoryLog::generateMovementCode(),
-                                'inventory_id'    => $inventory->id,
-                                'material_id'     => $giItem->material_id,
-                                'location_id'     => $gi->location_id,
-                                'user_id'         => Auth::id(),
-                                'type'            => 'sales_return',
-                                'quantity_before' => $qtyBefore,
-                                'quantity_change' => $qtyToRestore,
-                                'quantity_after'  => $newQty,
-                                'reference_id'    => $gi->id,
-                                'reference_type'  => GoodsIssue::class,
-                                'remarks'         => "GI {$gi->code} cancelled via SO cancellation",
-                            ]);
-                        }
-                    }
-
-                    // Recalculate avg unit price
-                    foreach ($gi->items->pluck('material_id')->unique() as $materialId) {
-                        Material::find($materialId)?->recalculateAvgUnitPrice();
-                    }
-                }
-
-                $gi->update(['status' => 'cancelled']);
-                $gi->logs()->create([
-                    'user_id'     => Auth::id(),
-                    'action'      => 'cancelled',
-                    'from_status' => $giFromStatus,
-                    'to_status'   => 'cancelled',
-                    'remarks'     => "Cancelled via SO {$salesOrder->code} cancellation",
-                ]);
-            }
-
-            $salesOrder->update(['status' => 'cancelled']);
-            $salesOrder->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'cancelled',
-                'from_status' => $fromStatus,
-                'to_status'   => 'cancelled',
-                'remarks'     => 'Sales order cancelled',
-            ]);
-        });
-
-        return redirect()->route('sales-orders.show', $salesOrder->id)
-            ->with('success', 'Sales order and all related goods issues cancelled.');
+        return redirect()
+            ->route('sales-orders.show', $salesOrder->id)
+            ->with('success', "Sales order {$salesOrder->code} cancelled, including its goods issues.");
     }
 
-    public function revert(SalesOrder $salesOrder)
+    public function revert(SalesOrder $salesOrder): RedirectResponse
     {
-        if (!in_array($salesOrder->status, ['posted', 'cancelled'])) {
-            return back()->withErrors(['error' => 'Only posted or cancelled sales orders can be reverted to draft.']);
-        }
+        $this->authorize('revert', $salesOrder);
 
-        DB::transaction(function () use ($salesOrder) {
-            $fromStatus = $salesOrder->status;
+        $this->orders->revert($salesOrder);
 
-            // Revert all cancelled GIs back to pending
-            foreach ($salesOrder->goodsIssues()->where('status', 'cancelled')->get() as $gi) {
-                $gi->update(['status' => 'pending']);
-                $gi->logs()->create([
-                    'user_id'     => Auth::id(),
-                    'action'      => 'reverted',
-                    'from_status' => 'cancelled',
-                    'to_status'   => 'pending',
-                    'remarks'     => "Reverted to pending via SO {$salesOrder->code} revert",
-                ]);
-            }
-
-            $salesOrder->update(['status' => 'draft']);
-            $salesOrder->logs()->create([
-                'user_id'     => Auth::id(),
-                'action'      => 'reverted',
-                'from_status' => $fromStatus,
-                'to_status'   => 'draft',
-                'remarks'     => 'Sales order reverted to draft',
-            ]);
-        });
-
-        return redirect()->route('sales-orders.show', $salesOrder->id)
-            ->with('success', 'Sales order reverted to draft and all related goods issues reverted to pending.');
+        return redirect()
+            ->route('sales-orders.show', $salesOrder->id)
+            ->with('success', "Sales order {$salesOrder->code} reverted to draft.");
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private function syncItems(SalesOrder $so, array $items): void
+    /**
+     * Master data the create and edit forms need.
+     *
+     * @return array<string, mixed>
+     */
+    private function formOptions(): array
     {
-        $so->items()->delete();
-
-        foreach ($items as $index => $item) {
-            $unitPrice    = (float) $item['unit_price'];
-            $qty          = (float) $item['qty_ordered'];
-            $discountType = $item['discount_type'] ?? null;
-            $discountAmt  = (float) ($item['discount_amount'] ?? 0);
-            $isVatable    = (bool) ($item['is_vatable'] ?? false);
-            $vatType      = $item['vat_type'] ?? 'exclusive';
-            $vatRate      = (float) ($item['vat_rate'] ?? 12);
-
-            $unitAfterDiscount = $unitPrice;
-            if ($discountType === 'fixed') {
-                $unitAfterDiscount = max(0, $unitPrice - $discountAmt);
-            } elseif ($discountType === 'percentage') {
-                $unitAfterDiscount = $unitPrice * (1 - ($discountAmt / 100));
-            }
-
-            $netPrice = $unitAfterDiscount * $qty;
-            $vatPrice = 0;
-            if ($isVatable) {
-                if ($vatType === 'exclusive') {
-                    $vatPrice = $netPrice * ($vatRate / 100);
-                } else {
-                    $vatPrice = $netPrice - ($netPrice / (1 + ($vatRate / 100)));
-                }
-            }
-
-            $grossPrice = $vatType === 'exclusive' ? $netPrice + $vatPrice : $netPrice;
-
-            $so->items()->create([
-                'material_id'               => $item['material_id'],
-                'line_number'               => $index + 1,
-                'qty_ordered'               => $qty,
-                'qty_shipped'                => 0,
-                'unit_price'                => $unitPrice,
-                'discount_type'             => $discountType,
-                'discount_amount'           => $discountAmt,
-                'unit_price_after_discount' => $unitAfterDiscount,
-                'net_price'                 => $netPrice,
-                'is_vatable'                => $isVatable,
-                'vat_type'                  => $vatType,
-                'vat_rate'                  => $vatRate,
-                'vat_price'                 => $vatPrice,
-                'gross_price'               => $grossPrice,
-                'remarks'                   => $item['remarks'] ?? null,
-            ]);
-        }
-    }
-
-    private function syncCharges(SalesOrder $so, array $charges): void
-    {
-        $so->charges()->delete();
-
-        foreach ($charges as $chargeData) {
-            $charge = Charge::find($chargeData['charge_id']);
-            if (!$charge) continue;
-
-            $so->charges()->create([
-                'charge_id'       => $charge->id,
-                'name'            => $charge->name,
-                'type'            => $charge->type,
-                'value_type'      => $charge->value_type,
-                'value'           => $charge->value,
-                'computed_amount' => 0,
-            ]);
-        }
-    }
-
-    private function recalculateTotals(SalesOrder $so): void
-    {
-        $so->refresh();
-        $items = $so->items;
-
-        $totalGross = $items->sum(fn($i) => (float)$i->gross_price);
-
-        $headerDiscountTotal = 0;
-        if ($so->discount_type === 'fixed') {
-            $headerDiscountTotal = (float) $so->discount_amount;
-        } elseif ($so->discount_type === 'percentage') {
-            $headerDiscountTotal = $totalGross * ((float)$so->discount_amount / 100);
-        }
-
-        $afterHeaderDiscount = $totalGross - $headerDiscountTotal;
-
-        $totalCharges = 0;
-        foreach ($so->charges as $soCharge) {
-            $computed = $soCharge->value_type === 'fixed'
-                ? (float) $soCharge->value
-                : $afterHeaderDiscount * ((float)$soCharge->value / 100);
-
-            $soCharge->update(['computed_amount' => $computed]);
-            $totalCharges += $soCharge->type === 'tax' ? $computed : -$computed;
-        }
-
-        $grandTotal = $afterHeaderDiscount + $totalCharges;
-
-        $so->update([
-            'total_before_discount' => $items->sum(fn($i) => (float)$i->unit_price * (float)$i->qty_ordered),
-            'total_item_discount'   => $items->sum(fn($i) => ((float)$i->unit_price - (float)$i->unit_price_after_discount) * (float)$i->qty_ordered),
-            'total_net_price'       => $items->sum(fn($i) => (float)$i->net_price),
-            'total_vat'             => $items->sum(fn($i) => (float)$i->vat_price),
-            'total_gross'           => $totalGross,
-            'header_discount_total' => $headerDiscountTotal,
-            'total_charges'         => $totalCharges,
-            'grand_total'           => $grandTotal,
-        ]);
-    }
-
-    private function recalculateSoStatus(SalesOrder $so): void
-    {
-        $so->refresh();
-
-        foreach ($so->items as $soItem) {
-            $totalIssued = \App\Models\GoodsIssueItem::whereHas('goodsIssue', function ($q) use ($so) {
-                    $q->where('sales_order_id', $so->id)
-                    ->where('status', 'completed');
-                })
-                ->where('sales_order_item_id', $soItem->id)
-                ->sum('qty_to_ship');
-
-            $soItem->update(['qty_shipped' => $totalIssued]);
-        }
-
-        $so->refresh();
-
-        $allFull     = $so->items->every(fn($i) => (float)$i->qty_shipped >= (float)$i->qty_ordered);
-        $anyIssued   = $so->items->some(fn($i)  => (float)$i->qty_shipped > 0);
-
-        if ($so->status === 'cancelled') return;
-
-        if ($allFull) {
-            $so->update(['status' => 'fully_shipped']);
-        } elseif ($anyIssued) {
-            $so->update(['status' => 'partially_shipped']);
-        } else {
-            $so->update(['status' => 'posted']);
-        }
-
-        $so->logs()->create([
-            'user_id' => Auth::id(),
-            'action'  => 'status_recalculated',
-            'remarks' => "SO status recalculated to {$so->fresh()->status}",
-        ]);
+        return [
+            'customers' => Customer::query()->active()->orderBy('name')->get(),
+            'materials' => Material::query()->active()->withMasterData()->orderBy('name')->get(),
+            'charges' => Charge::query()->active()->orderBy('name')->get(),
+        ];
     }
 }

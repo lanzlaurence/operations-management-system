@@ -5,9 +5,11 @@ namespace App\Http\Controllers;
 use App\Http\Requests\StoreUomRequest;
 use App\Http\Requests\UpdateUomRequest;
 use App\Models\Uom;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Routing\Controllers\HasMiddleware;
 use Illuminate\Routing\Controllers\Middleware;
 use Inertia\Inertia;
+use Inertia\Response;
 
 class UomController extends Controller implements HasMiddleware
 {
@@ -21,37 +23,41 @@ class UomController extends Controller implements HasMiddleware
         ];
     }
 
-    public function index()
+    public function index(): Response
     {
         $uoms = Uom::latest()->get();
+
         return Inertia::render('uom/index', ['uoms' => $uoms]);
     }
 
-    public function create()
+    public function create(): Response
     {
         return Inertia::render('uom/create');
     }
 
-    public function store(StoreUomRequest $request)
+    public function store(StoreUomRequest $request): RedirectResponse
     {
         Uom::create($request->validated());
+
         return redirect()->route('uoms.index')->with('success', 'UOM created successfully');
     }
 
-    public function edit(Uom $uom)
+    public function edit(Uom $uom): Response
     {
         return Inertia::render('uom/edit', ['uom' => $uom]);
     }
 
-    public function update(UpdateUomRequest $request, Uom $uom)
+    public function update(UpdateUomRequest $request, Uom $uom): RedirectResponse
     {
         $uom->update($request->validated());
+
         return redirect()->route('uoms.index')->with('success', 'UOM updated successfully');
     }
 
-    public function destroy(Uom $uom)
+    public function destroy(Uom $uom): RedirectResponse
     {
         $uom->delete();
+
         return redirect()->route('uoms.index')->with('success', 'UOM deleted successfully');
     }
 }
