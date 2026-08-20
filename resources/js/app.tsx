@@ -9,7 +9,7 @@ import { buildThemeStyle, getTheme, ThemeKey } from './lib/themes';
 
 createInertiaApp({
     title: (title) => {
-        const appName = (window as any).Laravel?.appName || 'ERP Web';
+        const appName = (window as any).Laravel?.appName || 'Operations Management System';
         return title ? `${title} - ${appName}` : appName;
     },
     resolve: (name) =>
@@ -22,7 +22,7 @@ createInertiaApp({
 
         (window as any).Laravel = {
             ...(window as any).Laravel,
-            appName: pageProps.preferences?.app_name || 'ERP Web',
+            appName: pageProps.preferences?.app_name || 'Operations Management System',
         };
 
         // Inject color theme CSS on initial load

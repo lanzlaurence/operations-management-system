@@ -45,7 +45,7 @@ class HandleInertiaRequests extends Middleware
                 'user' => $request->user() ? $request->user()->load('roles.permissions') : null,
             ],
             'preferences' => [
-                'app_name' => Preference::get('app_name', 'ERP Web'),
+                'app_name' => Preference::get('app_name', 'Operations Management System'),
                 'app_logo' => $this->getLogoUrl(),
                 'decimal_places' => (int) Preference::get('decimal_places', '2'),
                 'color_theme' => Preference::get('color_theme', 'zinc'),

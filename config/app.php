@@ -13,7 +13,7 @@ return [
     |
     */
 
-    'name' => env('APP_NAME', 'ERP Web'),
+    'name' => env('APP_NAME', 'Operations Management System'),
 
     /*
     |--------------------------------------------------------------------------

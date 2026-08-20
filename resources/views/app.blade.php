@@ -4,7 +4,7 @@
         {{-- <script src="http://localhost:8097"></script> --}}
 
         @php
-            $appName = \App\Models\Preference::get('app_name', config('app.name', 'ERP Web'));
+            $appName = \App\Models\Preference::get('app_name', config('app.name', 'Operations Management System'));
             $appLogo = \App\Models\Preference::get('app_logo', 'default-logo.jpg');
 
             if ($appLogo === 'default-logo.jpg') {
@@ -48,7 +48,7 @@
             }
         </style>
 
-        <title inertia>{{ \App\Models\Preference::get('app_name', config('app.name', 'ERP Web')) }}</title>
+        <title inertia>{{ \App\Models\Preference::get('app_name', config('app.name', 'Operations Management System')) }}</title>
 
         <link rel="icon" href="{{ $logoUrl }}" type="image/png">
         <link rel="apple-touch-icon" href="{{ $logoUrl }}">

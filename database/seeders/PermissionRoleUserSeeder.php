@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Hash;
 use Spatie\Permission\Models\Permission;
 use Spatie\Permission\Models\Role;
 
-class PermissionRoleLocalUserSeeder extends Seeder
+class PermissionRoleUserSeeder extends Seeder
 {
     public function run(): void
     {
@@ -106,10 +106,10 @@ class PermissionRoleLocalUserSeeder extends Seeder
         $adminRole = Role::create(['name' => 'Admin']);
         $adminRole->givePermissionTo(Permission::all());
 
-        // Create Admin user (Local)
+        // Create Admin user
         User::create([
             'name' => 'Administrator',
-            'email' => 'admin@erp.local',
+            'email' => 'admin@example.com',
             'email_verified_at' => now(),
             'password' => Hash::make('P@ssw0rd'),
             'force_password_change' => false,

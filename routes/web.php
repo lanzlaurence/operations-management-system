@@ -17,8 +17,6 @@ Route::middleware(['auth', 'active'])->group(function () {
 
 Route::middleware(['auth', 'active', 'verified', 'password.changed'])->group(function () {
     Route::get('dashboard', [App\Http\Controllers\DashboardController::class, 'index'])->name('dashboard');
-    Route::get('dashboard/material/{material}/purchase-history', [App\Http\Controllers\DashboardController::class, 'purchaseHistory'])->name('dashboard.material.purchase-history');
-    Route::get('dashboard/material/{material}/sales-history', [App\Http\Controllers\DashboardController::class, 'salesHistory'])->name('dashboard.material.sales-history');
 
     Route::resource('users', App\Http\Controllers\UserController::class);
     Route::resource('roles', App\Http\Controllers\RoleController::class);
@@ -33,6 +31,8 @@ Route::middleware(['auth', 'active', 'verified', 'password.changed'])->group(fun
     Route::resource('charges', App\Http\Controllers\ChargeController::class);
     // Route::resource('currencies', App\Http\Controllers\CurrencyController::class);
 
+    Route::get('materials/{material}/purchase-history', [App\Http\Controllers\MaterialController::class, 'purchaseHistory'])->name('materials.purchase-history');
+    Route::get('materials/{material}/sales-history', [App\Http\Controllers\MaterialController::class, 'salesHistory'])->name('materials.sales-history');
     Route::resource('materials', App\Http\Controllers\MaterialController::class);
     Route::resource('vendors', App\Http\Controllers\VendorController::class);
     Route::resource('customers', App\Http\Controllers\CustomerController::class);

@@ -102,7 +102,7 @@ export default function PurchaseHistory({ material, purchaseHistory, stockByLoca
                         <p className="text-sm text-muted-foreground">{material.code} — {material.name}</p>
                     </div>
                     <Button variant="outline" size="sm" asChild>
-                        <Link href="/dashboard"><ArrowLeft className="mr-2 h-4 w-4" />Back</Link>
+                        <Link href="/materials"><ArrowLeft className="mr-2 h-4 w-4" />Back</Link>
                     </Button>
                 </div>
 
@@ -136,6 +136,7 @@ export default function PurchaseHistory({ material, purchaseHistory, stockByLoca
 PurchaseHistory.layout = (page: React.ReactNode) => (
     <AppLayout breadcrumbs={[
         { title: 'Dashboard', href: '/dashboard' },
+        { title: 'Materials', href: '/materials' },
         { title: 'Purchase History', href: '#' },
     ]}>{page}</AppLayout>
 );

@@ -27,7 +27,7 @@ class PreferenceController extends Controller implements HasMiddleware
     public function index()
     {
         $formData = [
-            'app_name' => Preference::get('app_name', 'ERP Web'),
+            'app_name' => Preference::get('app_name', 'Operations Management System'),
             'app_logo_url' => $this->getLogoUrl(),
             'decimal_places' => Preference::get('decimal_places', '2'),
             'color_theme' => Preference::get('color_theme', 'blue'),

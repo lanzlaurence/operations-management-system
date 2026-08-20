@@ -57,6 +57,60 @@ export type MaterialHistoryData = {
     stock_by_location: StockByLocation[];
 };
 
+export type DashboardStats = {
+    materials: number;
+    stock_qty: number;
+    stock_value: number;
+    low_stock: number;
+    out_of_stock: number;
+    purchase_value: number;
+    sales_value: number;
+    open_po: number;
+    open_so: number;
+    vendors: number;
+    customers: number;
+};
+
+export type MonthlyTrendPoint = {
+    month: string;
+    purchases: number;
+    sales: number;
+};
+
+export type CategoryValue = {
+    category: string;
+    value: number;
+};
+
+export type MaterialValue = {
+    code: string;
+    name: string;
+    value: number;
+};
+
+export type LowStockItem = {
+    id: number;
+    code: string;
+    name: string;
+    uom: string | null;
+    stock: number;
+    reorder_level: number;
+};
+
+export type StatusCount = {
+    status: string;
+    total: number;
+};
+
 export type DashboardData = {
-    materials: DashboardMaterialRow[];
+    stats: DashboardStats;
+    monthlyTrend: MonthlyTrendPoint[];
+    stockByCategory: CategoryValue[];
+    topStockValue: MaterialValue[];
+    topSoldValue: MaterialValue[];
+    lowStockItems: LowStockItem[];
+    orderStatus: {
+        purchase: StatusCount[];
+        sales: StatusCount[];
+    };
 };

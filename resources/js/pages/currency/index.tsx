@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button';
 import { DataTable } from '@/components/data-table';
 import { ColumnDef } from '@tanstack/react-table';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
-import { Edit, Eye, Plus, Trash2 } from 'lucide-react';
+import { Edit, Plus, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 import { usePage } from '@inertiajs/react';
 import type { CurrencyData, Currency, SharedData } from '@/types';
@@ -69,14 +69,6 @@ export default function Index({ currencies }: CurrencyData) {
             size: 130,
             cell: ({ row }) => (
                 <div className="flex justify-end gap-1">
-                    {hasPermission('currency-view') && (
-                        <Button variant="ghost" size="sm" asChild>
-                            <Link href={`/currencies/${row.original.id}`} className="flex flex-col items-center gap-1 h-auto py-1 w-14">
-                                <Eye className="h-4 w-4" />
-                                <span className="text-[10px] leading-none">View</span>
-                            </Link>
-                        </Button>
-                    )}
                     {hasPermission('currency-edit') && (
                         <Button variant="ghost" size="sm" asChild>
                             <Link href={`/currencies/${row.original.id}/edit`} className="flex flex-col items-center gap-1 h-auto py-1 w-14">

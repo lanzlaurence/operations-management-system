@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { DataTable } from '@/components/data-table';
 import { ColumnDef } from '@tanstack/react-table';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
-import { Edit, Eye, Plus, Trash2 } from 'lucide-react';
+import { Edit, Eye, Plus, ShoppingBag, ShoppingCart, Trash2 } from 'lucide-react';
 import { useState } from 'react';
 import { usePage } from '@inertiajs/react';
 import type { MaterialData, Material, SharedData } from '@/types';
@@ -105,6 +105,29 @@ export default function Index({ materials }: MaterialData) {
                 <Badge variant={row.original.status === 'active' ? 'default' : 'secondary'}>
                     {row.original.status}
                 </Badge>
+            ),
+        },
+        {
+            id: 'history',
+            header: 'History',
+            enableSorting: false,
+            enableColumnFilter: false,
+            size: 130,
+            cell: ({ row }) => (
+                <div className="flex justify-end gap-1">
+                    <Button variant="ghost" size="sm" asChild>
+                        <Link href={`/materials/${row.original.id}/purchase-history`} className="flex flex-col items-center gap-1 h-auto py-1 w-14">
+                            <ShoppingCart className="h-4 w-4 text-blue-600" />
+                            <span className="text-[10px] leading-none">Purchase</span>
+                        </Link>
+                    </Button>
+                    <Button variant="ghost" size="sm" asChild>
+                        <Link href={`/materials/${row.original.id}/sales-history`} className="flex flex-col items-center gap-1 h-auto py-1 w-14">
+                            <ShoppingBag className="h-4 w-4 text-green-600" />
+                            <span className="text-[10px] leading-none">Sales</span>
+                        </Link>
+                    </Button>
+                </div>
             ),
         },
         {

@@ -10,7 +10,7 @@ class PreferenceSeeder extends Seeder
     public function run(): void
     {
         $preferences = [
-            ['key' => 'app_name', 'value' => 'ERP Web', 'type' => 'text'],
+            ['key' => 'app_name', 'value' => 'Operations Management System', 'type' => 'text'],
             ['key' => 'app_logo', 'value' => 'default-logo.jpg', 'type' => 'image'],
             ['key' => 'decimal_places', 'value' => '2', 'type' => 'number'],
             ['key' => 'color_theme', 'value' => 'zinc', 'type' => 'text'],
