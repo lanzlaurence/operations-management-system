@@ -12,8 +12,10 @@ class EnsurePasswordChanged
     public function handle(Request $request, Closure $next): Response
     {
         if (Auth::check() && Auth::user()->force_password_change) {
-            // Allow access to the change password route itself
-            if ($request->routeIs('password.change') || $request->routeIs('password.change.update')) {
+            // The change-password screen itself has to stay reachable. Livewire
+            // updates post to their own endpoint, which this middleware is not
+            // applied to, so the form on that screen still submits.
+            if ($request->routeIs('password.change')) {
                 return $next($request);
             }
 

@@ -9,8 +9,6 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Support\Str;
-use Inertia\Inertia;
-use Laravel\Fortify\Features;
 use Laravel\Fortify\Fortify;
 
 class FortifyServiceProvider extends ServiceProvider
@@ -45,27 +43,26 @@ class FortifyServiceProvider extends ServiceProvider
     /**
      * Configure Fortify views.
      */
+    /**
+     * Configure Fortify views.
+     *
+     * Fortify owns every endpoint these forms post to, so the views only have
+     * to use the field names it expects.
+     */
     private function configureViews(): void
     {
-        Fortify::loginView(fn (Request $request) => Inertia::render('auth/login', [
-            'canResetPassword' => Features::enabled(Features::resetPasswords()),
-            'status' => $request->session()->get('status'),
+        Fortify::loginView(fn () => view('auth.login'));
+
+        Fortify::requestPasswordResetLinkView(fn () => view('auth.forgot-password'));
+
+        Fortify::resetPasswordView(fn (Request $request) => view('auth.reset-password', [
+            'email' => (string) $request->email,
+            'token' => (string) $request->route('token'),
         ]));
 
-        Fortify::resetPasswordView(fn (Request $request) => Inertia::render('auth/reset-password', [
-            'email' => $request->email,
-            'token' => $request->route('token'),
-        ]));
+        Fortify::verifyEmailView(fn () => view('auth.verify-email'));
 
-        Fortify::requestPasswordResetLinkView(fn (Request $request) => Inertia::render('auth/forgot-password', [
-            'status' => $request->session()->get('status'),
-        ]));
-
-        Fortify::verifyEmailView(fn (Request $request) => Inertia::render('auth/verify-email', [
-            'status' => $request->session()->get('status'),
-        ]));
-
-        Fortify::confirmPasswordView(fn () => Inertia::render('auth/confirm-password'));
+        Fortify::confirmPasswordView(fn () => view('auth.confirm-password'));
     }
 
     /**

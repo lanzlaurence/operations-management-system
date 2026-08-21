@@ -1,1 +1,1 @@
-ERP Web
+Operations Management System

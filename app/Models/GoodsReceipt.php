@@ -2,16 +2,30 @@
 
 namespace App\Models;
 
+use App\Enums\GoodsReceiptStatus;
+use App\Models\Concerns\GeneratesDocumentCode;
+use App\Models\Concerns\HasTransactionLogs;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Illuminate\Database\Eloquent\Relations\MorphMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+/**
+ * Stock received into a location against a purchase order.
+ *
+ * While pending it is only a plan; completing it is the single moment stock is
+ * booked in (see GoodsReceiptService).
+ *
+ * @property GoodsReceiptStatus $status
+ */
 class GoodsReceipt extends Model
 {
-    use HasFactory, SoftDeletes;
+    use GeneratesDocumentCode;
+    use HasFactory;
+    use HasTransactionLogs;
+    use SoftDeletes;
 
     protected $fillable = [
         'code', 'purchase_order_id', 'user_id',
@@ -19,42 +33,111 @@ class GoodsReceipt extends Model
         'transaction_date', 'remarks',
     ];
 
-    protected $casts = [
-        'gr_date'          => 'date',
-        'transaction_date' => 'date',
-    ];
-
-    protected static function boot()
+    protected function casts(): array
     {
-        parent::boot();
-        static::creating(function ($gr) {
-            if (empty($gr->code))      $gr->code      = self::generateCode();
-        });
+        return [
+            'status' => GoodsReceiptStatus::class,
+            'gr_date' => 'date',
+            'transaction_date' => 'date',
+        ];
     }
 
-    public static function generateCode(): string
+    protected static function documentCodePrefix(): string
     {
-        $prefix = 'GR-4' . now()->format('ym');
-        $last = self::withTrashed()->where('code', 'like', $prefix . '%')->orderBy('id', 'desc')->first();
-        $next = $last ? ((int) substr($last->code, -4)) + 1 : 1;
-        return $prefix . str_pad($next, 4, '0', STR_PAD_LEFT);
+        return 'GR-4';
     }
 
-    public function purchaseOrder(): BelongsTo { return $this->belongsTo(PurchaseOrder::class); }
-    public function user(): BelongsTo          { return $this->belongsTo(User::class); }
-    public function location(): BelongsTo   { return $this->belongsTo(Location::class); }
-    public function items(): HasMany           { return $this->hasMany(GoodsReceiptItem::class); }
-    public function logs(): MorphMany          { return $this->morphMany(TransactionLog::class, 'loggable'); }
+    // ── Relations ────────────────────────────────────────────────────────────
 
-    // ── Permission checks ─────────────────────────────────────────────────────
-    public function canBeEdited(): bool    { return $this->status === 'pending'; }
-    public function canBeDeleted(): bool   { return $this->status === 'pending'; }
-    public function canBeCompleted(): bool { return $this->status === 'pending'; }
-    public function canBeCancelled(): bool { return in_array($this->status, ['pending', 'completed']); }
+    public function purchaseOrder(): BelongsTo
+    {
+        return $this->belongsTo(PurchaseOrder::class);
+    }
+
+    public function user(): BelongsTo
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    public function location(): BelongsTo
+    {
+        return $this->belongsTo(Location::class);
+    }
+
+    public function items(): HasMany
+    {
+        return $this->hasMany(GoodsReceiptItem::class);
+    }
+
+    // ── Scopes ───────────────────────────────────────────────────────────────
+
+    /**
+     * @param  Builder<static>  $query
+     */
+    public function scopePending(Builder $query): void
+    {
+        $query->where('status', GoodsReceiptStatus::Pending->value);
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     */
+    public function scopeCompleted(Builder $query): void
+    {
+        $query->where('status', GoodsReceiptStatus::Completed->value);
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     */
+    public function scopeCancelled(Builder $query): void
+    {
+        $query->where('status', GoodsReceiptStatus::Cancelled->value);
+    }
+
+    // ── Derived state ────────────────────────────────────────────────────────
+
+    public function canBeEdited(): bool
+    {
+        return $this->status->allowsEditing();
+    }
+
+    public function canBeDeleted(): bool
+    {
+        return $this->status->allowsDeletion();
+    }
+
+    public function canBeCompleted(): bool
+    {
+        return $this->status->allowsCompletion() && ! ($this->purchaseOrder?->status->isCancelled() ?? false);
+    }
+
+    public function canBeCancelled(): bool
+    {
+        return $this->status->allowsCancellation();
+    }
+
     public function canBeReverted(): bool
     {
-        if ($this->status !== 'cancelled') return false;
-        return $this->purchaseOrder?->status !== 'cancelled';
+        return $this->status->allowsRevert() && ! ($this->purchaseOrder?->status->isCancelled() ?? false);
     }
-    public function wasCompleted(): bool   { return $this->status === 'completed'; }
+
+    public function wasCompleted(): bool
+    {
+        return $this->status->isCompleted();
+    }
+
+    /**
+     * @return array<string, bool>
+     */
+    public function actionFlags(): array
+    {
+        return [
+            'edit' => $this->canBeEdited(),
+            'delete' => $this->canBeDeleted(),
+            'complete' => $this->canBeCompleted(),
+            'cancel' => $this->canBeCancelled(),
+            'revert' => $this->canBeReverted(),
+        ];
+    }
 }

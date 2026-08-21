@@ -2,15 +2,27 @@
 
 namespace App\Models;
 
-use App\Traits\HasEntityLog;
+use App\Enums\RecordStatus;
+use App\Models\Concerns\GeneratesSequentialCode;
+use App\Models\Concerns\HasEntityLogs;
+use App\Models\Concerns\HasRecordStatus;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+/**
+ * A buyer. Codes run from 100001 upwards.
+ *
+ * @property RecordStatus $status
+ */
 class Customer extends Model
 {
-    use HasFactory, SoftDeletes, HasEntityLog;
+    use GeneratesSequentialCode;
+    use HasEntityLogs;
+    use HasFactory;
+    use HasRecordStatus;
+    use SoftDeletes;
 
     protected $fillable = [
         'code', 'name', 'country', 'state_province', 'city',
@@ -18,27 +30,27 @@ class Customer extends Model
         'payment_terms', 'contact_persons', 'credit_amount', 'status',
     ];
 
-    protected $casts = [
-        'contact_persons' => 'array',
-        'credit_amount' => 'decimal:2',
-    ];
-
-    protected static function boot()
+    protected function casts(): array
     {
-        parent::boot();
-        static::creating(function ($customer) {
-            if (empty($customer->code)) {
-                $customer->code = self::generateNextCode();
-            }
-        });
+        return [
+            'status' => RecordStatus::class,
+            'contact_persons' => 'array',
+            'credit_amount' => 'decimal:2',
+        ];
     }
 
-    private static function generateNextCode(): string
+    protected static function sequentialCodePrefix(): string
     {
-        $last = self::withTrashed()->where('code', 'like', '1%')->orderBy('code', 'desc')->first();
-        if (!$last) return '100001';
-        return '1' . str_pad((int) substr($last->code, 1) + 1, 5, '0', STR_PAD_LEFT);
+        return '1';
     }
 
-    public function logs(): HasMany { return $this->hasMany(CustomerLog::class); }
+    public function logs(): HasMany
+    {
+        return $this->hasMany(CustomerLog::class);
+    }
+
+    public function salesOrders(): HasMany
+    {
+        return $this->hasMany(SalesOrder::class);
+    }
 }

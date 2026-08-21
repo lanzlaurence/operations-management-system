@@ -1,27 +1,32 @@
 <?php
 
-use App\Http\Controllers\Settings\PasswordController;
-use App\Http\Controllers\Settings\ProfileController;
+use App\Livewire\Settings\Appearance;
+use App\Livewire\Settings\Password;
+use App\Livewire\Settings\Profile;
 use Illuminate\Support\Facades\Route;
-use Inertia\Inertia;
+
+/*
+|--------------------------------------------------------------------------
+| Personal settings
+|--------------------------------------------------------------------------
+|
+| Everyone's own account: profile, password and appearance. These are Livewire
+| screens that write through the authenticated user, so there are no separate
+| update endpoints - the component owns both the form and the save.
+|
+| The account menu and Fortify's redirects both point at these route names, so
+| they are worth leaving alone.
+|
+*/
 
 Route::middleware(['auth'])->group(function () {
     Route::redirect('settings', '/settings/profile');
 
-    Route::get('settings/profile', [ProfileController::class, 'edit'])->name('profile.edit');
-    Route::patch('settings/profile', [ProfileController::class, 'update'])->name('profile.update');
+    Route::get('settings/profile', Profile::class)->name('profile.edit');
 });
 
 Route::middleware(['auth', 'verified'])->group(function () {
-    Route::delete('settings/profile', [ProfileController::class, 'destroy'])->name('profile.destroy');
+    Route::get('settings/password', Password::class)->name('user-password.edit');
 
-    Route::get('settings/password', [PasswordController::class, 'edit'])->name('user-password.edit');
-
-    Route::put('settings/password', [PasswordController::class, 'update'])
-        ->middleware('throttle:6,1')
-        ->name('user-password.update');
-
-    Route::get('settings/appearance', function () {
-        return Inertia::render('settings/appearance');
-    })->name('appearance.edit');
+    Route::get('settings/appearance', Appearance::class)->name('appearance.edit');
 });

@@ -2,15 +2,27 @@
 
 namespace App\Models;
 
-use App\Traits\HasEntityLog;
+use App\Enums\RecordStatus;
+use App\Models\Concerns\GeneratesSequentialCode;
+use App\Models\Concerns\HasEntityLogs;
+use App\Models\Concerns\HasRecordStatus;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+/**
+ * A supplier. Codes run from 200001 upwards.
+ *
+ * @property RecordStatus $status
+ */
 class Vendor extends Model
 {
-    use HasFactory, SoftDeletes, HasEntityLog;
+    use GeneratesSequentialCode;
+    use HasEntityLogs;
+    use HasFactory;
+    use HasRecordStatus;
+    use SoftDeletes;
 
     protected $fillable = [
         'code', 'name', 'country', 'state_province', 'city',
@@ -18,27 +30,27 @@ class Vendor extends Model
         'payment_terms', 'contact_persons', 'credit_amount', 'status',
     ];
 
-    protected $casts = [
-        'contact_persons' => 'array',
-        'credit_amount' => 'decimal:2',
-    ];
-
-    protected static function boot()
+    protected function casts(): array
     {
-        parent::boot();
-        static::creating(function ($vendor) {
-            if (empty($vendor->code)) {
-                $vendor->code = self::generateNextCode();
-            }
-        });
+        return [
+            'status' => RecordStatus::class,
+            'contact_persons' => 'array',
+            'credit_amount' => 'decimal:2',
+        ];
     }
 
-    private static function generateNextCode(): string
+    protected static function sequentialCodePrefix(): string
     {
-        $last = self::withTrashed()->where('code', 'like', '2%')->orderBy('code', 'desc')->first();
-        if (!$last) return '200001';
-        return '2' . str_pad((int) substr($last->code, 1) + 1, 5, '0', STR_PAD_LEFT);
+        return '2';
     }
 
-    public function logs(): HasMany { return $this->hasMany(VendorLog::class); }
+    public function logs(): HasMany
+    {
+        return $this->hasMany(VendorLog::class);
+    }
+
+    public function purchaseOrders(): HasMany
+    {
+        return $this->hasMany(PurchaseOrder::class);
+    }
 }
