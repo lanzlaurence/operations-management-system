@@ -7,7 +7,7 @@ namespace App\Enums\Concerns;
  *
  * Keeping them in one trait means each enum exposes the same small API
  * (`values()`, `options()`, `rule()`, `parse()`) that the form requests,
- * services and Inertia payloads rely on.
+ * services and view payloads rely on.
  */
 trait EnumHelpers
 {
@@ -38,7 +38,7 @@ trait EnumHelpers
      */
     public static function rule(): string
     {
-        return 'in:' . implode(',', self::values());
+        return 'in:'.implode(',', self::values());
     }
 
     /**

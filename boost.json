@@ -1,6 +1,8 @@
 {
     "agents": [
-        "cursor"
+        "claude_code"
     ],
-    "guidelines": []
+    "mcp": true,
+    "nightwatch": false,
+    "sail": false
 }

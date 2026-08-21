@@ -1,100 +1,180 @@
 <?php
 
-use App\Http\Controllers\ActivityController;
-use App\Http\Controllers\BrandController;
-use App\Http\Controllers\CategoryController;
-use App\Http\Controllers\ChargeController;
-use App\Http\Controllers\CustomerController;
-use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\FileController;
-use App\Http\Controllers\GoodsIssueController;
-use App\Http\Controllers\GoodsReceiptController;
-use App\Http\Controllers\InventoryController;
-use App\Http\Controllers\LocationController;
-use App\Http\Controllers\MaterialController;
-use App\Http\Controllers\PasswordChangeController;
-use App\Http\Controllers\PreferenceController;
-use App\Http\Controllers\PurchaseOrderController;
-use App\Http\Controllers\RoleController;
-use App\Http\Controllers\SalesOrderController;
-use App\Http\Controllers\UomController;
-use App\Http\Controllers\UserController;
-use App\Http\Controllers\VendorController;
+use App\Livewire\Activity;
+use App\Livewire\Auth;
+use App\Livewire\Brands;
+use App\Livewire\Categories;
+use App\Livewire\Charges;
+use App\Livewire\Currencies;
+use App\Livewire\Customers;
+use App\Livewire\Dashboard;
+use App\Livewire\GoodsIssues;
+use App\Livewire\GoodsReceipts;
+use App\Livewire\Inventories;
+use App\Livewire\Locations;
+use App\Livewire\Materials;
+use App\Livewire\Preferences;
+use App\Livewire\PurchaseOrders;
+use App\Livewire\Roles;
+use App\Livewire\SalesOrders;
+use App\Livewire\Uoms;
+use App\Livewire\Users;
+use App\Livewire\Vendors;
 use Illuminate\Support\Facades\Route;
-use Inertia\Inertia;
 
-Route::get('/', function () {
-    return Inertia::render('welcome');
-})->name('home');
+Route::view('/', 'welcome')->name('home');
 
 Route::middleware(['auth', 'active'])->group(function () {
-    Route::get('password/change', [PasswordChangeController::class, 'index'])
-        ->name('password.change');
-    Route::post('password/change', [PasswordChangeController::class, 'update'])
-        ->name('password.change.update');
+    Route::get('password/change', Auth\ChangePassword::class)->name('password.change');
 });
 
 Route::middleware(['auth', 'active', 'verified', 'password.changed'])->group(function () {
-    Route::get('dashboard', [DashboardController::class, 'index'])->name('dashboard');
+    Route::get('dashboard', Dashboard::class)->name('dashboard');
 
-    Route::resource('users', UserController::class);
-    Route::resource('roles', RoleController::class);
+    Route::prefix('users')->name('users.')->group(function () {
+        Route::get('/', Users\Index::class)->name('index')->middleware('permission:user-view');
+        Route::get('create', Users\Form::class)->name('create')->middleware('permission:user-create');
+        Route::get('{user}/edit', Users\Form::class)->name('edit')->middleware('permission:user-edit');
+    });
 
-    Route::get('preferences', [PreferenceController::class, 'index'])->name('preferences.index');
-    Route::post('preferences', [PreferenceController::class, 'update'])->name('preferences.update');
+    Route::prefix('roles')->name('roles.')->group(function () {
+        Route::get('/', Roles\Index::class)->name('index')->middleware('permission:role-view');
+        Route::get('create', Roles\Form::class)->name('create')->middleware('permission:role-create');
+        Route::get('{role}/edit', Roles\Form::class)->name('edit')->middleware('permission:role-edit');
+    });
 
-    Route::resource('brands', BrandController::class);
-    Route::resource('categories', CategoryController::class);
-    Route::resource('uoms', UomController::class);
-    Route::resource('locations', LocationController::class);
-    Route::resource('charges', ChargeController::class);
-    // Route::resource('currencies', App\Http\Controllers\CurrencyController::class);
+    Route::prefix('currencies')->name('currencies.')->group(function () {
+        Route::get('/', Currencies\Index::class)->name('index')->middleware('permission:currency-view');
+        Route::get('create', Currencies\Form::class)->name('create')->middleware('permission:currency-create');
+        Route::get('{currency}/edit', Currencies\Form::class)->name('edit')->middleware('permission:currency-edit');
+    });
 
-    Route::get('materials/{material}/purchase-history', [MaterialController::class, 'purchaseHistory'])->name('materials.purchase-history');
-    Route::get('materials/{material}/sales-history', [MaterialController::class, 'salesHistory'])->name('materials.sales-history');
-    Route::resource('materials', MaterialController::class);
-    Route::resource('vendors', VendorController::class);
-    Route::resource('customers', CustomerController::class);
+    Route::get('preferences', Preferences\Edit::class)
+        ->name('preferences.index')->middleware('permission:preference-view');
 
-    Route::get('inventories/manual-adjustment', [InventoryController::class, 'manualAdjustment'])->name('inventories.manual-adjustment');
-    Route::post('inventories/manual-adjustment', [InventoryController::class, 'processManualAdjustment'])->name('inventories.manual-adjustment.process');
-    // Stock is opened, corrected and moved through the manual adjustment screen,
-    // never created directly, so the resource only exposes reading and removal.
-    Route::resource('inventories', InventoryController::class)->only(['index', 'show', 'destroy']);
+    /*
+    |------------------------------------------------------------------
+    | Business modules
+    |------------------------------------------------------------------
+    |
+    | One Livewire component per screen, grouped by module. Index, create and
+    | edit share a component where the screens are the same shape, so the URL
+    | is what tells them apart.
+    |
+    */
+    Route::prefix('brands')->name('brands.')->group(function () {
+        Route::get('/', Brands\Index::class)->name('index')->middleware('permission:brand-view');
+        Route::get('create', Brands\Form::class)->name('create')->middleware('permission:brand-create');
+        Route::get('{brand}/edit', Brands\Form::class)->name('edit')->middleware('permission:brand-edit');
+    });
 
-    // Purchase Orders
-    Route::resource('purchase-orders', PurchaseOrderController::class);
-    Route::post('purchase-orders/{purchaseOrder}/post', [PurchaseOrderController::class, 'post'])->name('purchase-orders.post');
-    Route::post('purchase-orders/{purchaseOrder}/cancel', [PurchaseOrderController::class, 'cancel'])->name('purchase-orders.cancel');
-    Route::post('purchase-orders/{purchaseOrder}/revert', [PurchaseOrderController::class, 'revert'])->name('purchase-orders.revert');
+    Route::prefix('categories')->name('categories.')->group(function () {
+        Route::get('/', Categories\Index::class)->name('index')->middleware('permission:category-view');
+        Route::get('create', Categories\Form::class)->name('create')->middleware('permission:category-create');
+        Route::get('{category}/edit', Categories\Form::class)->name('edit')->middleware('permission:category-edit');
+    });
 
-    // Goods Receipts
-    Route::resource('goods-receipts', GoodsReceiptController::class);
-    Route::post('goods-receipts/{goodsReceipt}/complete', [GoodsReceiptController::class, 'complete'])->name('goods-receipts.complete');
-    Route::post('goods-receipts/{goodsReceipt}/cancel', [GoodsReceiptController::class, 'cancel'])->name('goods-receipts.cancel');
-    Route::post('goods-receipts/{goodsReceipt}/revert', [GoodsReceiptController::class, 'revert'])->name('goods-receipts.revert');
+    Route::prefix('uoms')->name('uoms.')->group(function () {
+        Route::get('/', Uoms\Index::class)->name('index')->middleware('permission:uom-view');
+        Route::get('create', Uoms\Form::class)->name('create')->middleware('permission:uom-create');
+        Route::get('{uom}/edit', Uoms\Form::class)->name('edit')->middleware('permission:uom-edit');
+    });
 
-    // GR from PO
-    Route::get('purchase-orders/{purchaseOrder}/goods-receipts/create', [GoodsReceiptController::class, 'create'])->name('purchase-orders.goods-receipts.create');
+    Route::prefix('locations')->name('locations.')->group(function () {
+        Route::get('/', Locations\Index::class)->name('index')->middleware('permission:location-view');
+        Route::get('create', Locations\Form::class)->name('create')->middleware('permission:location-create');
+        Route::get('{location}/edit', Locations\Form::class)->name('edit')->middleware('permission:location-edit');
+    });
 
-    // Sales Orders
-    Route::resource('sales-orders', SalesOrderController::class);
-    Route::post('sales-orders/{salesOrder}/post', [SalesOrderController::class, 'post'])->name('sales-orders.post');
-    Route::post('sales-orders/{salesOrder}/cancel', [SalesOrderController::class, 'cancel'])->name('sales-orders.cancel');
-    Route::post('sales-orders/{salesOrder}/revert', [SalesOrderController::class, 'revert'])->name('sales-orders.revert');
+    Route::prefix('inventories')->name('inventories.')->group(function () {
+        Route::get('/', Inventories\Index::class)->name('index')->middleware('permission:inventory-view');
+        Route::get('manual-adjustment', Inventories\Adjust::class)
+            ->name('manual-adjustment')->middleware('permission:inventory-adjust');
+        Route::get('{inventory}', Inventories\Show::class)->name('show')->middleware('permission:inventory-view');
+    });
+    Route::prefix('materials')->name('materials.')->group(function () {
+        Route::get('/', Materials\Index::class)->name('index')->middleware('permission:material-view');
+        Route::get('create', Materials\Form::class)->name('create')->middleware('permission:material-create');
+        Route::get('{material}/purchase-history', Materials\PurchaseHistory::class)
+            ->name('purchase-history')->middleware('permission:material-view');
+        Route::get('{material}/sales-history', Materials\SalesHistory::class)
+            ->name('sales-history')->middleware('permission:material-view');
+        Route::get('{material}', Materials\Show::class)->name('show')->middleware('permission:material-view');
+        Route::get('{material}/edit', Materials\Form::class)->name('edit')->middleware('permission:material-edit');
+    });
+    Route::prefix('vendors')->name('vendors.')->group(function () {
+        Route::get('/', Vendors\Index::class)->name('index')->middleware('permission:vendor-view');
+        Route::get('create', Vendors\Form::class)->name('create')->middleware('permission:vendor-create');
+        Route::get('{vendor}', Vendors\Show::class)->name('show')->middleware('permission:vendor-view');
+        Route::get('{vendor}/edit', Vendors\Form::class)->name('edit')->middleware('permission:vendor-edit');
+    });
+    Route::prefix('customers')->name('customers.')->group(function () {
+        Route::get('/', Customers\Index::class)->name('index')->middleware('permission:customer-view');
+        Route::get('create', Customers\Form::class)->name('create')->middleware('permission:customer-create');
+        Route::get('{customer}', Customers\Show::class)->name('show')->middleware('permission:customer-view');
+        Route::get('{customer}/edit', Customers\Form::class)->name('edit')->middleware('permission:customer-edit');
+    });
+    Route::prefix('charges')->name('charges.')->group(function () {
+        Route::get('/', Charges\Index::class)->name('index')->middleware('permission:charge-view');
+        Route::get('create', Charges\Form::class)->name('create')->middleware('permission:charge-create');
+        Route::get('{charge}/edit', Charges\Form::class)->name('edit')->middleware('permission:charge-edit');
+    });
 
-    // Goods Issues
-    Route::resource('goods-issues', GoodsIssueController::class);
-    Route::post('goods-issues/{goodsIssue}/complete', [GoodsIssueController::class, 'complete'])->name('goods-issues.complete');
-    Route::post('goods-issues/{goodsIssue}/cancel', [GoodsIssueController::class, 'cancel'])->name('goods-issues.cancel');
-    Route::post('goods-issues/{goodsIssue}/revert', [GoodsIssueController::class, 'revert'])->name('goods-issues.revert');
+    /*
+    |------------------------------------------------------------------
+    | Purchasing
+    |------------------------------------------------------------------
+    |
+    | The status actions (post, cancel, revert, complete) are methods on the
+    | document components rather than POST routes: the component owns the
+    | confirmation and the service owns the rules.
+    |
+    */
+    Route::prefix('purchase-orders')->name('purchase-orders.')->group(function () {
+        Route::get('/', PurchaseOrders\Index::class)->name('index')->middleware('permission:purchase-order-view');
+        Route::get('create', PurchaseOrders\Form::class)->name('create')->middleware('permission:purchase-order-create');
+        Route::get('{purchaseOrder}', PurchaseOrders\Show::class)->name('show')->middleware('permission:purchase-order-view');
+        Route::get('{purchaseOrder}/edit', PurchaseOrders\Form::class)->name('edit')->middleware('permission:purchase-order-edit');
 
-    // GI from SO
-    Route::get('sales-orders/{salesOrder}/goods-issues/create', [GoodsIssueController::class, 'create'])->name('sales-orders.goods-issues.create');
+        // Receiving starts from the order it is receiving against.
+        Route::get('{purchaseOrder}/goods-receipts/create', GoodsReceipts\Form::class)
+            ->name('goods-receipts.create')->middleware('permission:goods-receipt-create');
+    });
+
+    Route::prefix('goods-receipts')->name('goods-receipts.')->group(function () {
+        Route::get('/', GoodsReceipts\Index::class)->name('index')->middleware('permission:goods-receipt-view');
+        Route::get('{goodsReceipt}', GoodsReceipts\Show::class)->name('show')->middleware('permission:goods-receipt-view');
+        Route::get('{goodsReceipt}/edit', GoodsReceipts\Form::class)->name('edit')->middleware('permission:goods-receipt-edit');
+    });
+
+    /*
+    |------------------------------------------------------------------
+    | Sales
+    |------------------------------------------------------------------
+    */
+    Route::prefix('sales-orders')->name('sales-orders.')->group(function () {
+        Route::get('/', SalesOrders\Index::class)->name('index')->middleware('permission:sales-order-view');
+        Route::get('create', SalesOrders\Form::class)->name('create')->middleware('permission:sales-order-create');
+        Route::get('{salesOrder}', SalesOrders\Show::class)->name('show')->middleware('permission:sales-order-view');
+        Route::get('{salesOrder}/edit', SalesOrders\Form::class)->name('edit')->middleware('permission:sales-order-edit');
+
+        // Shipping starts from the order it is shipping against.
+        Route::get('{salesOrder}/goods-issues/create', GoodsIssues\Form::class)
+            ->name('goods-issues.create')->middleware('permission:goods-issue-create');
+    });
+
+    Route::prefix('goods-issues')->name('goods-issues.')->group(function () {
+        Route::get('/', GoodsIssues\Index::class)->name('index')->middleware('permission:goods-issue-view');
+        Route::get('{goodsIssue}', GoodsIssues\Show::class)->name('show')->middleware('permission:goods-issue-view');
+        Route::get('{goodsIssue}/edit', GoodsIssues\Form::class)->name('edit')->middleware('permission:goods-issue-edit');
+    });
 
     Route::prefix('activity')->name('activity.')->group(function () {
-        Route::get('transaction-log', [ActivityController::class, 'transactionLog'])->name('transaction-log');
-        Route::get('inventory-log', [ActivityController::class, 'inventoryLog'])->name('inventory-log');
+        Route::get('transaction-log', Activity\TransactionLog::class)
+            ->name('transaction-log')->middleware('permission:activity-transaction-log');
+        Route::get('inventory-log', Activity\InventoryLog::class)
+            ->name('inventory-log')->middleware('permission:activity-inventory-log');
     });
 
     // Private file access

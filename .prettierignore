@@ -1,2 +1,4 @@
-resources/js/components/ui/*
-resources/views/mail/*
+public/build
+vendor
+node_modules
+resources/views/vendor
